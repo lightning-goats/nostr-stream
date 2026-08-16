@@ -16,6 +16,7 @@ FALLBACK_IMAGE="https://primaldata.s3.us-east-005.backblazeb2.com/cache/0/6c/63/
 TITLE="⚡ Lightning Goats ⚡ Live Goat Feeder"
 SUMMARY="Welcome to the Lightning Goats, the world’s first Bitcoin-powered interactive goat feeder! From morning to evening Mountain Time (GMT -7), you can send sats to treat the herd. When the feeder reaches 100%, it automatically dispenses goodies for the goats."
 ANNOUNCEMENT_TEXT="Zap Notes. Feed Goats."
+ANNOUNCEMENT_HASHTAG="#CyberHerd"
 
 # Try these individually for NIP-46 RPC.
 BUNKER_RELAYS=(
@@ -220,11 +221,12 @@ announce_stream() {
     fi
 
     short_url="https://youtu.be/$video_id"
-    content="${ANNOUNCEMENT_TEXT}"$'\n'"${short_url}"
+    content="${ANNOUNCEMENT_TEXT}"$'\n'"${short_url}"$'\n'"${ANNOUNCEMENT_HASHTAG}"
 
     echo "Publishing once-per-stream Nostr note..."
     echo "  $ANNOUNCEMENT_TEXT"
     echo "  $short_url"
+    echo "  $ANNOUNCEMENT_HASHTAG"
 
     if ! publish_announcement_event \
         -k 1 \
@@ -233,6 +235,7 @@ announce_stream() {
         -t 'r=wss://nos.lol/' \
         -t 'r=wss://nostr.chaima.info/' \
         -t 'r=wss://relay.damus.io/' \
+        -t 't=cyberherd' \
         -t 'client=nostr-stream'
     then
         echo "nostr-stream: announcement note publication failed" >&2
