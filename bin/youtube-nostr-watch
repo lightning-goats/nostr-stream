@@ -117,9 +117,6 @@ handle_live() {
 
     if [[ "$old_id" == "$video_id" ]]; then
         if nostr_is_active; then
-            # `announce` is idempotent. Calling it on each successful live poll
-            # gives a failed initial kind-1 publication a chance to recover
-            # without ever intentionally creating a second note for this video.
             ensure_announcement "$url" || true
             return
         fi
@@ -132,9 +129,9 @@ handle_live() {
     if [[ -n "$old_id" ]]; then
         log "Live video changed: $old_id -> $video_id"
 
-        if timeout 45s "$NOSTR_STREAM" stop; then
+        if timeout 45s "$NOSTR_STREAM" stop --delete-goal; then
             rm -f "$ACTIVE_ID_FILE"
-            log "Previous Nostr stream stopped"
+            log "Previous Nostr stream stopped and zap goal retired"
         else
             log "Failed to stop previous Nostr stream"
             return
@@ -148,9 +145,6 @@ handle_live() {
         printf '%s\n' "$video_id" > "$ACTIVE_ID_FILE"
         log "Nostr stream started"
 
-        # start attempts this itself, but this extra idempotent call ensures the
-        # watcher owns retries if the promotional note failed while the NIP-53
-        # live event succeeded.
         ensure_announcement "$url" || true
     else
         log "Failed to start Nostr stream"
@@ -174,7 +168,7 @@ handle_offline() {
         return
     fi
 
-    log "YouTube stream confirmed ended; stopping Nostr stream"
+    log "YouTube stream confirmed ended; stopping Nostr stream and retiring zap goal"
 
     if ! nostr_is_active; then
         log "Nostr stream is already inactive; clearing watcher state"
@@ -183,10 +177,10 @@ handle_offline() {
         return
     fi
 
-    if timeout 45s "$NOSTR_STREAM" stop; then
+    if timeout 45s "$NOSTR_STREAM" stop --delete-goal; then
         rm -f "$ACTIVE_ID_FILE"
         set_misses 0
-        log "Nostr stream stopped"
+        log "Nostr stream stopped and zap goal retired"
     else
         log "Failed to stop Nostr stream; will retry"
     fi
@@ -196,9 +190,8 @@ log "Watching $CHANNEL"
 
 while true; do
     # Keep an already-active NIP-53 event fresh even if YouTube metadata is
-    # temporarily unavailable (for example a bot challenge or transient error).
-    # The conditional publisher performs no network work until the 20-minute
-    # refresh interval has elapsed.
+    # temporarily unavailable. refresh-if-due also ensures the active stream
+    # has its per-YouTube-video NIP-75 zap goal.
     if nostr_is_active; then
         ensure_freshness || true
     fi
