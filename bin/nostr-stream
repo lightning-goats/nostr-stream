@@ -16,6 +16,7 @@ GOAL_ID_FILE="$STATE_DIR/goal-id"
 GOAL_VIDEO_FILE="$STATE_DIR/goal-video-id"
 
 FALLBACK_IMAGE="https://primaldata.s3.us-east-005.backblazeb2.com/cache/0/6c/63/06c633c820a33a891fa1f3ee248115d7c3accf3e44845da8cf4080a6a1c92c8b.png"
+LIVE_STREAM_URL="https://lightning-goats.com/hls/live_goats.m3u8"
 
 TITLE="⚡ Lightning Goats ⚡ Live Goat Feeder"
 SUMMARY="Welcome to the Lightning Goats, the world’s first Bitcoin-powered interactive goat feeder! From morning to evening Mountain Time (GMT -7), you can send sats to treat the herd. When the feeder reaches 100%, it automatically dispenses goodies for the goats."
@@ -336,7 +337,7 @@ publish_live_state() {
         -c '' \
         -t "title=$TITLE" \
         -t "summary=$SUMMARY" \
-        -t "streaming=$url" \
+        -t "streaming=$LIVE_STREAM_URL" \
         -t "image=$image" \
         -t "starts=$start" \
         -t 'status=live' \
@@ -365,7 +366,7 @@ publish_ended_state() {
         -c '' \
         -t "title=$TITLE" \
         -t "summary=$SUMMARY" \
-        -t "streaming=$url" \
+        -t "streaming=$LIVE_STREAM_URL" \
         -t "recording=$url" \
         -t "image=$image" \
         -t "starts=$start" \
@@ -464,9 +465,10 @@ start_stream() {
     goal_id="$ENSURED_GOAL_ID"
 
     echo "Publishing Nostr live event..."
-    echo "Stream URL:  $url"
-    echo "Cover image: $image"
-    [[ -z "$goal_id" ]] || echo "Zap goal:    $goal_id ($GOAL_AMOUNT_SATS sats)"
+    echo "YouTube URL:  $url"
+    echo "Playback URL: $LIVE_STREAM_URL"
+    echo "Cover image:  $image"
+    [[ -z "$goal_id" ]] || echo "Zap goal:     $goal_id ($GOAL_AMOUNT_SATS sats)"
 
     if ! publish_live_state "$url" "$stream_id" "$start" "$image" "$goal_id"; then
         die "could not publish live event"
@@ -482,10 +484,11 @@ start_stream() {
 
     echo
     echo "Nostr stream LIVE"
-    echo "  id:    $stream_id"
-    echo "  video: $url"
-    echo "  cover: $image"
-    [[ -z "$goal_id" ]] || echo "  goal:  $goal_id ($GOAL_AMOUNT_SATS sats)"
+    echo "  id:        $stream_id"
+    echo "  streaming: $LIVE_STREAM_URL"
+    echo "  YouTube:   $url"
+    echo "  cover:     $image"
+    [[ -z "$goal_id" ]] || echo "  goal:      $goal_id ($GOAL_AMOUNT_SATS sats)"
 
     if ! announce_stream "$url"; then
         echo "nostr-stream: live event is active; announcement will need retry" >&2
@@ -531,9 +534,10 @@ refresh_stream() {
     chmod 600 "$LAST_REFRESH_FILE"
 
     echo "Nostr stream refreshed"
-    echo "  id:    $stream_id"
-    echo "  video: $url"
-    [[ -z "$goal_id" ]] || echo "  goal:  $goal_id ($GOAL_AMOUNT_SATS sats)"
+    echo "  id:        $stream_id"
+    echo "  streaming: $LIVE_STREAM_URL"
+    echo "  YouTube:   $url"
+    [[ -z "$goal_id" ]] || echo "  goal:      $goal_id ($GOAL_AMOUNT_SATS sats)"
 }
 
 refresh_if_due() {
@@ -615,14 +619,14 @@ stop_stream() {
 
     echo
     echo "Nostr stream ENDED"
-    echo "  id:    $stream_id"
-    echo "  video: $url"
-    echo "  cover: $image"
+    echo "  id:        $stream_id"
+    echo "  recording: $url"
+    echo "  cover:     $image"
     if [[ -n "$goal_id" ]]; then
         if [[ "$delete_goal_after" == "true" ]]; then
-            echo "  goal:  $goal_id (deletion requested)"
+            echo "  goal:      $goal_id (deletion requested)"
         else
-            echo "  goal:  $goal_id (preserved)"
+            echo "  goal:      $goal_id (preserved)"
         fi
     fi
 }
@@ -687,7 +691,8 @@ status_stream() {
 
     echo "Nostr stream LIVE"
     echo "  id:           $(cat "$STATE_DIR/id")"
-    echo "  video:        $url"
+    echo "  streaming:    $LIVE_STREAM_URL"
+    echo "  YouTube:      $url"
     echo "  cover:        $image"
     echo "  start:        $(cat "$STATE_DIR/start")"
     echo "  last-refresh: $last_refresh"
