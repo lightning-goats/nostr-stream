@@ -10,7 +10,10 @@ BUNKER_PUB_FILE="$HOME/.config/nak/bunker.pub"
 CLIENT_CRED="$HOME/.config/nak/credentials/nostr-client.cred"
 STATE_DIR="$HOME/.local/state/lightning-goats-stream"
 ANNOUNCEMENT_DIR="$STATE_DIR/announced"
+GOAL_DIR="$STATE_DIR/goals"
 LAST_REFRESH_FILE="$STATE_DIR/last-refresh"
+GOAL_ID_FILE="$STATE_DIR/goal-id"
+GOAL_VIDEO_FILE="$STATE_DIR/goal-video-id"
 
 FALLBACK_IMAGE="https://primaldata.s3.us-east-005.backblazeb2.com/cache/0/6c/63/06c633c820a33a891fa1f3ee248115d7c3accf3e44845da8cf4080a6a1c92c8b.png"
 
@@ -19,13 +22,20 @@ SUMMARY="Welcome to the Lightning Goats, the world’s first Bitcoin-powered int
 ANNOUNCEMENT_TEXT="Zap Notes. Feed Goats."
 ANNOUNCEMENT_HASHTAG="#CyberHerd"
 
+# One NIP-75 goal per YouTube broadcast: 10,000 sats = 10,000,000 millisats.
+GOAL_AMOUNT_MSAT="10000000"
+GOAL_AMOUNT_SATS="10000"
+GOAL_CONTENT="Feed the Lightning Goats — help trigger 10 feedings today!"
+GOAL_SUMMARY="10,000 sats funds up to 10 Lightning-powered goat feedings at 1,000 sats each."
+GOAL_RELAY_HINT="wss://nos.lol/"
+
 # Try these individually for NIP-46 RPC.
 BUNKER_RELAYS=(
     "nos.lol"
     "relay.damus.io"
 )
 
-# Relays used for NIP-53 live-event publication.
+# Relays used for NIP-53 live-event, NIP-75 goal, and deletion publication.
 PUBLISH_RELAYS=(
     "nos.lol"
     "relay.damus.io"
@@ -38,6 +48,9 @@ ANNOUNCEMENT_RELAYS=(
     "nostr.chaima.info"
     "relay.damus.io"
 )
+
+LAST_EVENT_ID=""
+ENSURED_GOAL_ID=""
 
 die() {
     echo "nostr-stream: $*" >&2
@@ -53,8 +66,8 @@ check_config() {
     [[ -s "$BUNKER_PUB_FILE" ]] || die "missing $BUNKER_PUB_FILE"
     [[ -s "$CLIENT_CRED" ]] || die "missing $CLIENT_CRED"
 
-    mkdir -p "$STATE_DIR" "$ANNOUNCEMENT_DIR"
-    chmod 700 "$STATE_DIR" "$ANNOUNCEMENT_DIR"
+    mkdir -p "$STATE_DIR" "$ANNOUNCEMENT_DIR" "$GOAL_DIR"
+    chmod 700 "$STATE_DIR" "$ANNOUNCEMENT_DIR" "$GOAL_DIR"
 }
 
 bunker_uri() {
@@ -145,6 +158,7 @@ publish_with_relays() {
     local relay
     local bunker
     local rc
+    local output
 
     case "$relay_group" in
         stream)
@@ -160,6 +174,7 @@ publish_with_relays() {
 
     NOSTR_CLIENT_KEY="$(load_client_key)"
     export NOSTR_CLIENT_KEY
+    LAST_EVENT_ID=""
 
     for relay in "${BUNKER_RELAYS[@]}"; do
         bunker="$(bunker_uri "$relay")"
@@ -167,20 +182,28 @@ publish_with_relays() {
         echo "NIP-46 signer via wss://$relay ..."
 
         set +e
-
-        timeout \
-            --signal=TERM \
-            --kill-after=2s \
-            15s \
-            "$NAK" --connect-timeout 5s event \
-                --sec "$bunker" \
-                "$@" \
-                "${target_relays[@]}"
-
+        output="$(
+            timeout \
+                --signal=TERM \
+                --kill-after=2s \
+                15s \
+                "$NAK" --connect-timeout 5s event \
+                    --sec "$bunker" \
+                    "$@" \
+                    "${target_relays[@]}" \
+                2>&1
+        )"
         rc=$?
         set -e
 
+        [[ -z "$output" ]] || printf '%s\n' "$output"
+
         if [[ $rc -eq 0 ]]; then
+            LAST_EVENT_ID="$(
+                printf '%s\n' "$output" |
+                    sed -nE 's/.*"id":"([0-9a-f]{64})".*/\1/p' |
+                    head -n1
+            )"
             unset NOSTR_CLIENT_KEY
             return 0
         fi
@@ -204,11 +227,108 @@ publish_announcement_event() {
     publish_with_relays announcement "$@"
 }
 
+ensure_goal() {
+    local url="$1"
+    local image="$2"
+    local video_id
+    local marker
+    local short_url
+    local goal_id=""
+
+    ENSURED_GOAL_ID=""
+    video_id="$(extract_youtube_id "$url" 2>/dev/null || true)"
+
+    if [[ -z "$video_id" ]]; then
+        echo "No YouTube video ID; skipping NIP-75 zap goal." >&2
+        return 0
+    fi
+
+    marker="$GOAL_DIR/$video_id"
+
+    if [[ -s "$marker" ]]; then
+        goal_id="$(tr -d '\r\n' < "$marker")"
+        if [[ "$goal_id" =~ ^[0-9a-f]{64}$ ]]; then
+            ENSURED_GOAL_ID="$goal_id"
+            printf '%s\n' "$goal_id" > "$GOAL_ID_FILE"
+            printf '%s\n' "$video_id" > "$GOAL_VIDEO_FILE"
+            chmod 600 "$GOAL_ID_FILE" "$GOAL_VIDEO_FILE"
+            echo "Reusing NIP-75 zap goal for YouTube video $video_id"
+            echo "  goal: $goal_id"
+            return 0
+        fi
+    fi
+
+    short_url="https://youtu.be/$video_id"
+
+    echo "Publishing 10,000-sat NIP-75 zap goal..."
+    echo "  video: $short_url"
+    echo "  target: $GOAL_AMOUNT_SATS sats"
+
+    if ! publish_stream_event \
+        -k 9041 \
+        -c "$GOAL_CONTENT" \
+        -t "amount=$GOAL_AMOUNT_MSAT" \
+        -t 'relays=wss://nos.lol/;wss://relay.damus.io/' \
+        -t "summary=$GOAL_SUMMARY" \
+        -t "image=$image" \
+        -t "r=$short_url" \
+        -t 'client=nostr-stream'
+    then
+        echo "nostr-stream: zap-goal publication failed" >&2
+        return 1
+    fi
+
+    goal_id="$LAST_EVENT_ID"
+    [[ "$goal_id" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "nostr-stream: goal published but event id could not be captured" >&2
+        return 1
+    }
+
+    printf '%s\n' "$goal_id" > "$marker"
+    printf '%s\n' "$goal_id" > "$GOAL_ID_FILE"
+    printf '%s\n' "$video_id" > "$GOAL_VIDEO_FILE"
+    chmod 600 "$marker" "$GOAL_ID_FILE" "$GOAL_VIDEO_FILE"
+
+    ENSURED_GOAL_ID="$goal_id"
+    echo "NIP-75 zap goal published"
+    echo "  goal: $goal_id"
+}
+
+delete_goal() {
+    local video_id="$1"
+    local goal_id="$2"
+    local marker="$GOAL_DIR/$video_id"
+
+    [[ "$goal_id" =~ ^[0-9a-f]{64}$ ]] || return 0
+
+    echo "Requesting deletion of completed NIP-75 zap goal..."
+    echo "  goal: $goal_id"
+
+    if ! publish_stream_event \
+        -k 5 \
+        -c 'Lightning Goats stream ended; retiring zap goal.' \
+        -t "e=$goal_id" \
+        -t 'k=9041'
+    then
+        echo "nostr-stream: zap-goal deletion request failed" >&2
+        return 1
+    fi
+
+    rm -f "$marker"
+    echo "Zap-goal deletion request published"
+}
+
 publish_live_state() {
     local url="$1"
     local stream_id="$2"
     local start="$3"
     local image="$4"
+    local goal_id="${5:-}"
+    local -a goal_args=()
+
+    if [[ "$goal_id" =~ ^[0-9a-f]{64}$ ]]; then
+        goal_args=(-t "goal=$goal_id;$GOAL_RELAY_HINT")
+    fi
 
     publish_stream_event \
         -k 30311 \
@@ -220,6 +340,38 @@ publish_live_state() {
         -t "image=$image" \
         -t "starts=$start" \
         -t 'status=live' \
+        "${goal_args[@]}" \
+        -t 't=bitcoin' \
+        -t 't=lightning' \
+        -t 't=goats'
+}
+
+publish_ended_state() {
+    local url="$1"
+    local stream_id="$2"
+    local start="$3"
+    local end="$4"
+    local image="$5"
+    local goal_id="${6:-}"
+    local -a goal_args=()
+
+    if [[ "$goal_id" =~ ^[0-9a-f]{64}$ ]]; then
+        goal_args=(-t "goal=$goal_id;$GOAL_RELAY_HINT")
+    fi
+
+    publish_stream_event \
+        -k 30311 \
+        -d "$stream_id" \
+        -c '' \
+        -t "title=$TITLE" \
+        -t "summary=$SUMMARY" \
+        -t "streaming=$url" \
+        -t "recording=$url" \
+        -t "image=$image" \
+        -t "starts=$start" \
+        -t "ends=$end" \
+        -t 'status=ended' \
+        "${goal_args[@]}" \
         -t 't=bitcoin' \
         -t 't=lightning' \
         -t 't=goats'
@@ -275,6 +427,7 @@ start_stream() {
     local start
     local stream_id
     local image
+    local goal_id=""
     local now
 
     [[ ! -e "$STATE_DIR/active" ]] || \
@@ -284,11 +437,17 @@ start_stream() {
     stream_id="lightning-goats-$(date -u +%Y%m%dT%H%M%SZ)"
     image="$(resolve_cover_image "$url")"
 
+    if ! ensure_goal "$url" "$image"; then
+        die "could not create or recover zap goal"
+    fi
+    goal_id="$ENSURED_GOAL_ID"
+
     echo "Publishing Nostr live event..."
     echo "Stream URL:  $url"
     echo "Cover image: $image"
+    [[ -z "$goal_id" ]] || echo "Zap goal:    $goal_id ($GOAL_AMOUNT_SATS sats)"
 
-    if ! publish_live_state "$url" "$stream_id" "$start" "$image"; then
+    if ! publish_live_state "$url" "$stream_id" "$start" "$image" "$goal_id"; then
         die "could not publish live event"
     fi
 
@@ -305,10 +464,8 @@ start_stream() {
     echo "  id:    $stream_id"
     echo "  video: $url"
     echo "  cover: $image"
+    [[ -z "$goal_id" ]] || echo "  goal:  $goal_id ($GOAL_AMOUNT_SATS sats)"
 
-    # The live-event publication succeeded, so a failure to publish the
-    # promotional kind-1 note must not roll back the live state. The watcher
-    # will retry `announce` on later polls until the marker is written.
     if ! announce_stream "$url"; then
         echo "nostr-stream: live event is active; announcement will need retry" >&2
     fi
@@ -321,6 +478,7 @@ refresh_stream() {
     local stream_id
     local start
     local image
+    local goal_id=""
     local now
 
     url="$(cat "$STATE_DIR/url")"
@@ -333,9 +491,16 @@ refresh_stream() {
         image="$FALLBACK_IMAGE"
     fi
 
+    # This also upgrades an already-running pre-goal stream on its next refresh.
+    if ! ensure_goal "$url" "$image"; then
+        echo "nostr-stream: could not create or recover zap goal for refresh" >&2
+        return 1
+    fi
+    goal_id="$ENSURED_GOAL_ID"
+
     echo "Refreshing Nostr live event..."
 
-    if ! publish_live_state "$url" "$stream_id" "$start" "$image"; then
+    if ! publish_live_state "$url" "$stream_id" "$start" "$image" "$goal_id"; then
         echo "nostr-stream: live-event refresh failed" >&2
         return 1
     fi
@@ -347,6 +512,7 @@ refresh_stream() {
     echo "Nostr stream refreshed"
     echo "  id:    $stream_id"
     echo "  video: $url"
+    [[ -z "$goal_id" ]] || echo "  goal:  $goal_id ($GOAL_AMOUNT_SATS sats)"
 }
 
 refresh_if_due() {
@@ -372,13 +538,19 @@ refresh_if_due() {
 }
 
 stop_stream() {
+    local delete_goal_after="${1:-false}"
+
     [[ -e "$STATE_DIR/active" ]] || die "no active stream"
+    [[ "$delete_goal_after" == "true" || "$delete_goal_after" == "false" ]] || \
+        die "invalid stop mode"
 
     local url
     local stream_id
     local start
     local end
     local image
+    local video_id=""
+    local goal_id=""
 
     url="$(cat "$STATE_DIR/url")"
     stream_id="$(cat "$STATE_DIR/id")"
@@ -391,25 +563,23 @@ stop_stream() {
         image="$FALLBACK_IMAGE"
     fi
 
+    video_id="$(extract_youtube_id "$url" 2>/dev/null || true)"
+    if [[ -s "$GOAL_ID_FILE" ]]; then
+        goal_id="$(tr -d '\r\n' < "$GOAL_ID_FILE")"
+    elif [[ -n "$video_id" && -s "$GOAL_DIR/$video_id" ]]; then
+        goal_id="$(tr -d '\r\n' < "$GOAL_DIR/$video_id")"
+    fi
+
     echo "Publishing Nostr ended event..."
 
-    if ! publish_stream_event \
-        -k 30311 \
-        -d "$stream_id" \
-        -c '' \
-        -t "title=$TITLE" \
-        -t "summary=$SUMMARY" \
-        -t "streaming=$url" \
-        -t "recording=$url" \
-        -t "image=$image" \
-        -t "starts=$start" \
-        -t "ends=$end" \
-        -t 'status=ended' \
-        -t 't=bitcoin' \
-        -t 't=lightning' \
-        -t 't=goats'
-    then
+    if ! publish_ended_state "$url" "$stream_id" "$start" "$end" "$image" "$goal_id"; then
         die "could not publish ended event; active state preserved"
+    fi
+
+    if [[ "$delete_goal_after" == "true" && -n "$video_id" && -n "$goal_id" ]]; then
+        if ! delete_goal "$video_id" "$goal_id"; then
+            die "stream ended, but zap-goal deletion failed; active state preserved for retry"
+        fi
     fi
 
     rm -f \
@@ -418,13 +588,40 @@ stop_stream() {
         "$STATE_DIR/id" \
         "$STATE_DIR/start" \
         "$STATE_DIR/image" \
-        "$LAST_REFRESH_FILE"
+        "$LAST_REFRESH_FILE" \
+        "$GOAL_ID_FILE" \
+        "$GOAL_VIDEO_FILE"
 
     echo
     echo "Nostr stream ENDED"
     echo "  id:    $stream_id"
     echo "  video: $url"
     echo "  cover: $image"
+    if [[ -n "$goal_id" ]]; then
+        if [[ "$delete_goal_after" == "true" ]]; then
+            echo "  goal:  $goal_id (deletion requested)"
+        else
+            echo "  goal:  $goal_id (preserved)"
+        fi
+    fi
+}
+
+delete_goal_for_url() {
+    local url="$1"
+    local video_id
+    local marker
+    local goal_id
+
+    video_id="$(extract_youtube_id "$url" 2>/dev/null || true)"
+    [[ -n "$video_id" ]] || die "delete-goal requires a YouTube stream URL"
+
+    marker="$GOAL_DIR/$video_id"
+    [[ -s "$marker" ]] || die "no stored zap goal for YouTube video $video_id"
+
+    goal_id="$(tr -d '\r\n' < "$marker")"
+    [[ "$goal_id" =~ ^[0-9a-f]{64}$ ]] || die "invalid stored zap-goal event id"
+
+    delete_goal "$video_id" "$goal_id"
 }
 
 status_stream() {
@@ -433,6 +630,7 @@ status_stream() {
     local video_id
     local note_status="n/a"
     local last_refresh="n/a"
+    local goal_id="n/a"
 
     if [[ ! -e "$STATE_DIR/active" ]]; then
         echo "No stream is marked active."
@@ -460,12 +658,22 @@ status_stream() {
         last_refresh="$(cat "$LAST_REFRESH_FILE")"
     fi
 
+    if [[ -s "$GOAL_ID_FILE" ]]; then
+        goal_id="$(tr -d '\r\n' < "$GOAL_ID_FILE")"
+    elif [[ -n "$video_id" && -s "$GOAL_DIR/$video_id" ]]; then
+        goal_id="$(tr -d '\r\n' < "$GOAL_DIR/$video_id")"
+    fi
+
     echo "Nostr stream LIVE"
     echo "  id:           $(cat "$STATE_DIR/id")"
     echo "  video:        $url"
     echo "  cover:        $image"
     echo "  start:        $(cat "$STATE_DIR/start")"
     echo "  last-refresh: $last_refresh"
+    echo "  goal:         $goal_id"
+    if [[ "$goal_id" != "n/a" ]]; then
+        echo "  goal-target:  $GOAL_AMOUNT_SATS sats"
+    fi
     echo "  note:         $note_status"
 }
 
@@ -478,8 +686,13 @@ case "${1:-}" in
         ;;
 
     stop)
-        [[ $# -eq 1 ]] || die "usage: nostr-stream stop"
-        stop_stream
+        if [[ $# -eq 1 ]]; then
+            stop_stream false
+        elif [[ $# -eq 2 && "$2" == "--delete-goal" ]]; then
+            stop_stream true
+        else
+            die "usage: nostr-stream stop [--delete-goal]"
+        fi
         ;;
 
     refresh)
@@ -497,6 +710,11 @@ case "${1:-}" in
         announce_stream "$2"
         ;;
 
+    delete-goal)
+        [[ $# -eq 2 ]] || die "usage: nostr-stream delete-goal <youtube-url>"
+        delete_goal_for_url "$2"
+        ;;
+
     status)
         [[ $# -eq 1 ]] || die "usage: nostr-stream status"
         status_stream
@@ -505,10 +723,11 @@ case "${1:-}" in
     *)
         echo "Usage:"
         echo "  nostr-stream start <stream-url>"
-        echo "  nostr-stream stop"
+        echo "  nostr-stream stop [--delete-goal]"
         echo "  nostr-stream refresh"
         echo "  nostr-stream refresh-if-due [seconds]"
         echo "  nostr-stream announce <youtube-url>"
+        echo "  nostr-stream delete-goal <youtube-url>"
         echo "  nostr-stream status"
         exit 2
         ;;
