@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+NAK="$(command -v nak || true)"
+CLIENT_PUB_FILE="$HOME/.config/nak/authorized-client.pub"
+
+[[ -n "$NAK" ]] || {
+    echo "nak-bunker: nak not found in PATH" >&2
+    exit 1
+}
+
+: "${CREDENTIALS_DIRECTORY:?systemd credentials unavailable}"
+
+[[ -s "$CREDENTIALS_DIRECTORY/nostr-key" ]] || {
+    echo "nak-bunker: nostr-key credential is missing" >&2
+    exit 1
+}
+
+[[ -s "$CLIENT_PUB_FILE" ]] || {
+    echo "nak-bunker: missing authorized client pubkey: $CLIENT_PUB_FILE" >&2
+    exit 1
+}
+
+CLIENT_PUB="$(tr -d '\r\n' < "$CLIENT_PUB_FILE")"
+
+[[ "$CLIENT_PUB" =~ ^[0-9a-fA-F]{64}$ ]] || {
+    echo "nak-bunker: authorized client pubkey is not 64-character hex" >&2
+    exit 1
+}
+
+export NOSTR_SECRET_KEY="$(cat "$CREDENTIALS_DIRECTORY/nostr-key")"
+
+exec "$NAK" -q bunker \
+    -k "$CLIENT_PUB" \
+    relay.nsec.app \
+    nos.lol \
+    relay.damus.io
