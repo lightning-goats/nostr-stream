@@ -5,6 +5,7 @@ umask 077
 CHANNEL="https://www.youtube.com/@lightning-goats/live"
 POLL_SECONDS=30
 OFFLINE_THRESHOLD=3
+REFRESH_SECONDS=1200
 
 YTDLP="$(command -v yt-dlp || true)"
 
@@ -61,6 +62,15 @@ ensure_announcement() {
     return 0
 }
 
+ensure_freshness() {
+    if ! timeout 45s "$NOSTR_STREAM" refresh-if-due "$REFRESH_SECONDS"; then
+        log "Failed to refresh Nostr live event; will retry"
+        return 1
+    fi
+
+    return 0
+}
+
 check_youtube() {
     local output
     local errfile
@@ -107,10 +117,11 @@ handle_live() {
 
     if [[ "$old_id" == "$video_id" ]]; then
         if nostr_is_active; then
-            # `announce` is idempotent. Calling it on each successful live poll
-            # gives a failed initial kind-1 publication a chance to recover
-            # without ever intentionally creating a second note for this video.
+            # Both operations are idempotent/conditional. Announcement retries
+            # only until its per-video marker exists; refresh publishes only
+            # when the active 30311 is at least REFRESH_SECONDS old.
             ensure_announcement "$url" || true
+            ensure_freshness || true
             return
         fi
 
