@@ -2,16 +2,102 @@
 
 Self-hosted Nostr live-stream publishing for the Lightning Goats YouTube channel.
 
-This project watches the Lightning Goats YouTube channel, detects when a broadcast goes live, and publishes the broadcast to Nostr as a NIP-53 `kind:30311` live-stream event. When the YouTube broadcast ends, it updates the same Nostr event to `status=ended`.
+This project watches the Lightning Goats YouTube channel, detects when a broadcast goes live, publishes a NIP-53 `kind:30311` live-stream event, keeps that event fresh while the broadcast is active, and updates it to `status=ended` when YouTube ends.
 
-For each distinct YouTube broadcast, it also publishes one regular Nostr `kind:1` announcement note containing:
+For each distinct YouTube broadcast it also:
+
+- creates one NIP-75 `kind:9041` zap goal for **10,000 sats**;
+- links the zap goal from the `kind:30311` event;
+- publishes one regular `kind:1` announcement note;
+- retires the zap goal with a NIP-09 deletion request when YouTube is confirmed ended.
+
+The video itself remains hosted by YouTube. Nostr provides discovery, live-event metadata, zap-goal metadata, and the once-per-broadcast announcement.
+
+## Announcement note
+
+Each YouTube video gets one regular note:
 
 ```text
 Zap Notes. Feed Goats.
 https://youtu.be/VIDEO_ID
+#CyberHerd
 ```
 
-The video itself remains hosted by YouTube. Nostr is used for discovery, live-event metadata, and the once-per-broadcast announcement. No zap.stream account or hosted Nostr streaming service is required.
+The event also carries `t=cyberherd` and relay-reference tags.
+
+## NIP-75 zap goal
+
+Each distinct YouTube video gets one `kind:9041` goal with a target of:
+
+```text
+10,000 sats = 10,000,000 millisats
+```
+
+The goal describes the target as up to ten 1,000-sat Lightning-powered goat feedings.
+
+Conceptually:
+
+```text
+YouTube broadcast
+      |
+      +--> kind 9041 zap goal (10,000 sats)
+      |          |
+      |          +--> persisted by YouTube video ID
+      |
+      +--> kind 30311 live event
+                  |
+                  +--> ["goal", "<9041-event-id>", "wss://nos.lol/"]
+```
+
+The feeder's own payment/cycle accounting remains authoritative. The NIP-75 goal represents Nostr-attributable zaps for the stream and is not used to actuate the feeder directly.
+
+### Goal lifetime and idempotency
+
+Goal IDs are stored under:
+
+```text
+~/.local/state/lightning-goats-stream/goals/VIDEO_ID
+```
+
+This means:
+
+- watcher restarts do not create another goal for the same YouTube video;
+- NIP-53 refreshes reuse the same goal;
+- a manual `nostr-stream stop` preserves the goal so watcher self-healing of a still-live YouTube broadcast reuses it;
+- when the watcher confirms that YouTube has ended, it calls `nostr-stream stop --delete-goal` and publishes a NIP-09 `kind:5` deletion request for the `kind:9041` goal.
+
+Nostr deletion is a request to relays and clients, not a guarantee that every copy disappears everywhere.
+
+A stored goal can also be retired manually:
+
+```bash
+nostr-stream delete-goal 'https://www.youtube.com/watch?v=VIDEO_ID'
+```
+
+## NIP-53 freshness
+
+Live Activity management clients are expected to keep `kind:30311` events updated. The watcher therefore republishes the same addressable event every **20 minutes** while local state says the stream is active.
+
+The refresh keeps the same:
+
+- `d` identifier;
+- title and summary;
+- YouTube streaming URL;
+- image;
+- original `starts` timestamp;
+- zap-goal event ID;
+- `status=live`.
+
+Only the event's timestamp/signature/version changes.
+
+Freshness is maintained even if a YouTube metadata check temporarily fails, so a bot challenge or transient `yt-dlp` error does not allow an otherwise-live NIP-53 event to become stale.
+
+Manual controls:
+
+```bash
+nostr-stream refresh
+nostr-stream refresh-if-due 1200
+```
 
 ## Components
 
@@ -23,26 +109,26 @@ YouTube @lightning-goats/live
           |
           v
       nostr-stream
-       /       \
-      /         \
- NIP-53 30311   kind-1 announcement
-      \         /
-       \       /
-        NIP-46
-          |
-          v
-      nak bunker
-          |
-          v
-     Nostr relays
+       /    |    \
+      /     |     \
+ 30311    9041    kind 1
+      \     |     /
+       \    |    /
+          NIP-46
+            |
+            v
+        nak bunker
+            |
+            v
+       Nostr relays
 ```
 
-The repository contains:
+Repository files:
 
 ```text
-bin/nak-bunker             NIP-46 signer launcher
-bin/nostr-stream           Start/stop NIP-53 and announce a YouTube stream
-bin/youtube-nostr-watch    YouTube live-state watcher
+bin/nak-bunker
+bin/nostr-stream
+bin/youtube-nostr-watch
 systemd/nak-bunker.service
 systemd/youtube-nostr-watch.service
 install.sh
@@ -52,8 +138,8 @@ install.sh
 
 Two separate keypairs are used:
 
-1. **Nostr identity key** — the identity that authors the NIP-53 events and regular announcement notes. Its private key is stored as a systemd encrypted credential and is only decrypted for the `nak bunker` process.
-2. **Automation client key** — a dedicated NIP-46 client keypair. Its public key is authorized by the bunker; its private key is stored separately as another systemd encrypted credential.
+1. **Nostr identity key** — authors NIP-53, NIP-75, deletion requests, and announcement notes. Its private key is stored as a systemd encrypted credential and decrypted only for the `nak bunker` process.
+2. **Automation client key** — dedicated NIP-46 client keypair. Its public key is authorized by the bunker and its private key is separately stored as a systemd encrypted credential.
 
 No private keys, encrypted credential files, or local bunker state belong in this repository.
 
@@ -106,7 +192,7 @@ mkdir -p ~/.config/nak/credentials
 chmod 700 ~/.config/nak ~/.config/nak/credentials
 ```
 
-Use the 64-character hex form of the Nostr identity private key:
+Encrypt the 64-character hex Nostr identity private key:
 
 ```bash
 read -rsp 'Nostr identity hex secret: ' NOSTR_HEX
@@ -123,7 +209,7 @@ unset NOSTR_HEX
 chmod 600 ~/.config/nak/credentials/nostr-key.cred
 ```
 
-Derive and store only its public key for the publisher:
+Store its public key:
 
 ```bash
 systemd-creds decrypt \
@@ -137,25 +223,13 @@ chmod 600 ~/.config/nak/bunker.pub
 
 ## Create and authorize the NIP-46 client
 
-Generate a dedicated automation client keypair:
-
 ```bash
 CLIENT_SEC="$(nak key generate)"
 CLIENT_PUB="$(printf '%s' "$CLIENT_SEC" | nak key public)"
 
-echo "Authorized client pubkey: $CLIENT_PUB"
-```
-
-Store the public key used by the bunker:
-
-```bash
 printf '%s\n' "$CLIENT_PUB" > ~/.config/nak/authorized-client.pub
 chmod 600 ~/.config/nak/authorized-client.pub
-```
 
-Encrypt the corresponding private key:
-
-```bash
 printf '%s' "$CLIENT_SEC" |
   systemd-creds encrypt \
     --user \
@@ -167,20 +241,6 @@ unset CLIENT_SEC
 chmod 600 ~/.config/nak/credentials/nostr-client.cred
 ```
 
-Verify the encrypted credential corresponds to the authorized public key without displaying the secret:
-
-```bash
-systemd-creds decrypt \
-  --user \
-  --name=nostr-client \
-  ~/.config/nak/credentials/nostr-client.cred - |
-  nak key public
-
-cat ~/.config/nak/authorized-client.pub
-```
-
-The two public keys must match.
-
 ## Start the bunker
 
 ```bash
@@ -189,29 +249,21 @@ systemctl --user enable --now nak-bunker.service
 systemctl --user status nak-bunker.service
 ```
 
-Logs:
-
-```bash
-journalctl --user -u nak-bunker.service -f
-```
-
-The launcher runs `nak bunker` in quiet mode. This is intentional: some `nak` versions print a restart command containing a supplied signer secret when the bunker is not persistent and logging is enabled.
-
-If the service must survive logout and start with the machine:
+If it must survive logout and start with the machine:
 
 ```bash
 sudo loginctl enable-linger "$USER"
 ```
 
-## Test publishing manually
+## Manual operation
 
-Before enabling the watcher, test the publisher with a real YouTube watch URL:
+Start a stream:
 
 ```bash
 nostr-stream start 'https://www.youtube.com/watch?v=VIDEO_ID'
 ```
 
-`start` first publishes the NIP-53 live event and records local live state. It then attempts the once-per-YouTube-stream regular announcement note. A failure of the regular note does not roll back an already-successful NIP-53 live event.
+This creates or recovers the video-specific 10,000-sat zap goal, publishes the NIP-53 event linked to that goal, records local state, and attempts the regular kind-1 announcement.
 
 Check state:
 
@@ -219,116 +271,69 @@ Check state:
 nostr-stream status
 ```
 
-The status includes:
+Typical output includes:
 
 ```text
-note:  published
+Nostr stream LIVE
+  id:           lightning-goats-...
+  video:        https://www.youtube.com/watch?v=...
+  cover:        ...
+  start:        ...
+  last-refresh: ...
+  goal:         <9041-event-id>
+  goal-target:  10000 sats
+  note:         published
 ```
 
-or:
-
-```text
-note:  pending
-```
-
-If the announcement is pending, retry it without touching the live-event state:
-
-```bash
-nostr-stream announce 'https://www.youtube.com/watch?v=VIDEO_ID'
-```
-
-End the event:
+A manual stop preserves the zap goal:
 
 ```bash
 nostr-stream stop
 ```
 
-`start` always requires an explicit stream URL. There is no implicit Twitch or other playback fallback.
+This is useful because the watcher will recreate the NIP-53 live event if YouTube is still live, and the same goal is reused.
 
-### NIP-53 event lifecycle
+To explicitly end a stream and retire its goal:
 
-`start` publishes a unique addressable `kind:30311` event containing:
-
-- `d`
-- `title`
-- `summary`
-- `streaming`
-- `image`
-- `starts`
-- `status=live`
-- `t=bitcoin`
-- `t=lightning`
-- `t=goats`
-
-`stop` republishes the same `kind + pubkey + d` address with:
-
-- `status=ended`
-- `ends=<unix timestamp>`
-- `recording=<stream URL>`
-
-while retaining the original stream metadata.
-
-Active state is stored under:
-
-```text
-~/.local/state/lightning-goats-stream/
+```bash
+nostr-stream stop --delete-goal
 ```
 
-The script does not mark a stream active until NIP-53 publication succeeds. If ending the event fails, it preserves the active state so `stop` can be retried.
+## Automatic YouTube monitoring
 
-## Once-per-stream regular Nostr note
-
-For a YouTube stream, `nostr-stream` extracts the 11-character YouTube video ID and uses it as the local idempotency key.
-
-The regular note is a `kind:1` event with content:
+The watcher monitors:
 
 ```text
-Zap Notes. Feed Goats.
-https://youtu.be/VIDEO_ID
+https://www.youtube.com/@lightning-goats/live
 ```
 
-It includes these `r` tags:
+Enable it after manual publishing works:
 
-```text
-wss://lnb.bolverker.com/nostrrelay/666
-wss://nos.lol/
-wss://nostr.chaima.info/
-wss://relay.damus.io/
+```bash
+systemctl --user enable --now youtube-nostr-watch.service
 ```
 
-and:
+Follow logs:
 
-```text
-client=nostr-stream
+```bash
+journalctl --user -u youtube-nostr-watch.service -f
 ```
 
-The note is published to:
+Default behavior:
 
-```text
-lnb.bolverker.com/nostrrelay/666
-nos.lol
-nostr.chaima.info
-relay.damus.io
-```
-
-After a successful announcement, a marker is written to:
-
-```text
-~/.local/state/lightning-goats-stream/announced/VIDEO_ID
-```
-
-That marker is deliberately **not** deleted by `nostr-stream stop`. Therefore:
-
-- restarting the NIP-53 event for the same still-live YouTube broadcast does not intentionally publish another regular note;
-- restarting the watcher does not intentionally publish another regular note;
-- `nostr-stream announce <youtube-url>` becomes a cheap no-op after the note has been successfully announced;
-- a new YouTube video ID gets a new regular note.
-
-This is local idempotency. If the state directory is deleted or the system is migrated without it, the same historical YouTube video can be announced again.
+- polls YouTube every 30 seconds;
+- starts only when `yt-dlp` reports `live_status=is_live`;
+- creates one zap goal per YouTube video ID;
+- publishes one regular announcement per YouTube video ID;
+- refreshes the active NIP-53 event every 20 minutes;
+- requires three consecutive confirmed-offline checks before ending Nostr;
+- treats extraction failures, DNS errors, timeouts, and YouTube bot challenges as indeterminate, not proof that the stream ended;
+- self-heals if Nostr is manually stopped while the same YouTube broadcast remains live;
+- retires the NIP-75 goal when YouTube is actually confirmed ended or a different live video replaces it.
 
 ## Cover images
 
-For a YouTube watch URL, `nostr-stream` extracts the video ID locally and tries:
+For a YouTube watch URL, `nostr-stream` tries:
 
 ```text
 https://i.ytimg.com/vi/VIDEO_ID/maxresdefault.jpg
@@ -337,91 +342,25 @@ https://i.ytimg.com/vi/VIDEO_ID/hqdefault.jpg
 
 If neither is available, it uses the configured Lightning Goats fallback image.
 
-This avoids giving the service browser cookies merely to retrieve a thumbnail.
-
-## Enable automatic YouTube monitoring
-
-The watcher monitors:
-
-```text
-https://www.youtube.com/@lightning-goats/live
-```
-
-Enable it only after manual start/stop works:
-
-```bash
-systemctl --user enable --now youtube-nostr-watch.service
-```
-
-Follow its log:
-
-```bash
-journalctl --user -u youtube-nostr-watch.service -f
-```
-
-Default behavior:
-
-- poll every 30 seconds;
-- start only when `yt-dlp` reports `live_status=is_live`;
-- construct the canonical `https://www.youtube.com/watch?v=VIDEO_ID` URL;
-- remember the YouTube video ID so the same broadcast is not repeatedly started;
-- publish one regular announcement note per YouTube video ID;
-- retry a failed regular announcement on later successful live polls while the NIP-53 event remains active;
-- require three consecutive confirmed-offline checks before ending Nostr, approximately 90 seconds at the default poll interval;
-- treat extraction failures, DNS errors, timeouts, and YouTube bot challenges as **indeterminate**, not as proof that the stream ended;
-- automatically repair state if Nostr was manually stopped while the same YouTube broadcast is still live.
-
-### Manual stop while YouTube is still live
-
-If the watcher is running and you execute:
-
-```bash
-nostr-stream stop
-```
-
-then the next successful watcher poll will see that YouTube is still live but Nostr is inactive, and it will publish a new NIP-53 live event.
-
-Because the regular-note marker for that YouTube video ID remains present, the self-healed NIP-53 event does **not** intentionally generate another regular announcement note.
-
-To intentionally keep a currently-live YouTube broadcast off Nostr:
-
-```bash
-systemctl --user stop youtube-nostr-watch.service
-nostr-stream stop
-```
-
-Re-enable automation later:
-
-```bash
-systemctl --user start youtube-nostr-watch.service
-```
-
-## YouTube bot challenges
-
-YouTube may occasionally cause `yt-dlp` to fail with a sign-in / bot-confirmation challenge. The watcher deliberately does not interpret this as offline.
-
-If a bot challenge occurs while a Nostr stream is already live, the Nostr event remains live until YouTube can again be checked successfully and three confirmed-offline checks occur.
-
-If bot challenges persist before a broadcast starts, the watcher may be unable to discover the live broadcast. Avoid adding personal browser cookies unless necessary and after considering the security implications.
-
 ## Operations
 
 ```bash
-# NIP-46 bunker
-systemctl --user status nak-bunker.service
-systemctl --user restart nak-bunker.service
-journalctl --user -u nak-bunker.service -f
+# Current state
+nostr-stream status
 
-# YouTube watcher
+# Force a NIP-53 refresh
+nostr-stream refresh
+
+# Idempotently ensure the announcement exists
+nostr-stream announce 'https://www.youtube.com/watch?v=VIDEO_ID'
+
+# Retire a stored zap goal manually
+nostr-stream delete-goal 'https://www.youtube.com/watch?v=VIDEO_ID'
+
+# Watcher
 systemctl --user status youtube-nostr-watch.service
 systemctl --user restart youtube-nostr-watch.service
 journalctl --user -u youtube-nostr-watch.service -f
-
-# Current local Nostr stream state
-nostr-stream status
-
-# Idempotently ensure the current YouTube video has its regular note
-nostr-stream announce 'https://www.youtube.com/watch?v=VIDEO_ID'
 ```
 
 ## Updating
@@ -430,21 +369,10 @@ nostr-stream announce 'https://www.youtube.com/watch?v=VIDEO_ID'
 cd nostr-stream
 git pull
 ./install.sh
-systemctl --user restart nak-bunker.service
 systemctl --user restart youtube-nostr-watch.service
 ```
 
-## Secret rotation
-
-To rotate the automation client without changing the public Nostr identity:
-
-1. generate a new client keypair;
-2. replace `~/.config/nak/authorized-client.pub` with the new public key;
-3. replace `nostr-client.cred` with an encrypted copy of the new private key;
-4. restart `nak-bunker.service`;
-5. test a manual start/stop.
-
-Rotating `nostr-key.cred` changes the Nostr identity itself and therefore changes the author pubkey of future live events and announcement notes.
+A bunker restart is only necessary when bunker code/configuration or credentials change.
 
 ## License
 
