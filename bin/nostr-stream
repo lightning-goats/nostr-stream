@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+NAK="$(command -v nak || true)"
+SYSTEMD_CREDS="$(command -v systemd-creds || true)"
+CURL="$(command -v curl || true)"
+
+BUNKER_PUB_FILE="$HOME/.config/nak/bunker.pub"
+CLIENT_CRED="$HOME/.config/nak/credentials/nostr-client.cred"
+STATE_DIR="$HOME/.local/state/lightning-goats-stream"
+
+FALLBACK_IMAGE="https://primaldata.s3.us-east-005.backblazeb2.com/cache/0/6c/63/06c633c820a33a891fa1f3ee248115d7c3accf3e44845da8cf4080a6a1c92c8b.png"
+
+TITLE="⚡ Lightning Goats ⚡ Live Goat Feeder"
+SUMMARY="Welcome to the Lightning Goats, the world’s first Bitcoin-powered interactive goat feeder! From morning to evening Mountain Time (GMT -7), you can send sats to treat the herd. When the feeder reaches 100%, it automatically dispenses goodies for the goats."
+
+BUNKER_RELAYS=(
+    "nos.lol"
+    "relay.damus.io"
+)
+
+PUBLISH_RELAYS=(
+    "nos.lol"
+    "relay.damus.io"
+)
+
+die() {
+    echo "nostr-stream: $*" >&2
+    exit 1
+}
+
+check_config() {
+    [[ -n "$NAK" ]] || die "nak not found in PATH"
+    [[ -n "$SYSTEMD_CREDS" ]] || die "systemd-creds not found in PATH"
+    [[ -n "$CURL" ]] || die "curl not found in PATH"
+    command -v timeout >/dev/null 2>&1 || die "timeout not found in PATH"
+
+    [[ -s "$BUNKER_PUB_FILE" ]] || die "missing $BUNKER_PUB_FILE"
+    [[ -s "$CLIENT_CRED" ]] || die "missing $CLIENT_CRED"
+
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+}
+
+bunker_uri() {
+    local relay="$1"
+    local pub
+
+    pub="$(tr -d '\r\n' < "$BUNKER_PUB_FILE")"
+
+    printf 'bunker://%s?relay=wss%%3A%%2F%%2F%s' \
+        "$pub" "$relay"
+}
+
+load_client_key() {
+    "$SYSTEMD_CREDS" decrypt \
+        --user \
+        --name=nostr-client \
+        "$CLIENT_CRED" -
+}
+
+resolve_cover_image() {
+    local url="$1"
+    local video_id=""
+    local image=""
+
+    if [[ "$url" =~ [\?\&]v=([^&]+) ]]; then
+        video_id="${BASH_REMATCH[1]}"
+    elif [[ "$url" =~ youtu\.be/([^/?]+) ]]; then
+        video_id="${BASH_REMATCH[1]}"
+    fi
+
+    if [[ -n "$video_id" ]]; then
+        image="https://i.ytimg.com/vi/${video_id}/maxresdefault.jpg"
+
+        if "$CURL" \
+            --fail \
+            --silent \
+            --location \
+            --head \
+            --max-time 5 \
+            "$image" \
+            >/dev/null 2>&1
+        then
+            printf '%s\n' "$image"
+            return
+        fi
+
+        image="https://i.ytimg.com/vi/${video_id}/hqdefault.jpg"
+
+        if "$CURL" \
+            --fail \
+            --silent \
+            --location \
+            --head \
+            --max-time 5 \
+            "$image" \
+            >/dev/null 2>&1
+        then
+            printf '%s\n' "$image"
+            return
+        fi
+    fi
+
+    printf '%s\n' "$FALLBACK_IMAGE"
+}
+
+publish() {
+    local relay
+    local bunker
+    local rc
+
+    NOSTR_CLIENT_KEY="$(load_client_key)"
+    export NOSTR_CLIENT_KEY
+
+    for relay in "${BUNKER_RELAYS[@]}"; do
+        bunker="$(bunker_uri "$relay")"
+
+        echo "NIP-46 signer via wss://$relay ..."
+
+        set +e
+
+        timeout \
+            --signal=TERM \
+            --kill-after=2s \
+            15s \
+            "$NAK" --connect-timeout 5s event \
+                --sec "$bunker" \
+                "$@" \
+                "${PUBLISH_RELAYS[@]}"
+
+        rc=$?
+        set -e
+
+        if [[ $rc -eq 0 ]]; then
+            unset NOSTR_CLIENT_KEY
+            return 0
+        fi
+
+        if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+            echo "NIP-46 timeout via $relay; trying next relay." >&2
+        else
+            echo "nak failed via $relay (exit $rc); trying next relay." >&2
+        fi
+    done
+
+    unset NOSTR_CLIENT_KEY
+    return 1
+}
+
+start_stream() {
+    local url="$1"
+    local start
+    local stream_id
+    local image
+
+    [[ ! -e "$STATE_DIR/active" ]] || \
+        die "stream already active; use: nostr-stream status"
+
+    start="$(date +%s)"
+    stream_id="lightning-goats-$(date -u +%Y%m%dT%H%M%SZ)"
+    image="$(resolve_cover_image "$url")"
+
+    echo "Publishing Nostr live event..."
+    echo "Stream URL:  $url"
+    echo "Cover image: $image"
+
+    if ! publish \
+        -k 30311 \
+        -d "$stream_id" \
+        -c '' \
+        -t "title=$TITLE" \
+        -t "summary=$SUMMARY" \
+        -t "streaming=$url" \
+        -t "image=$image" \
+        -t "starts=$start" \
+        -t 'status=live' \
+        -t 't=bitcoin' \
+        -t 't=lightning' \
+        -t 't=goats'
+    then
+        die "could not publish live event"
+    fi
+
+    printf '%s\n' "$url"       > "$STATE_DIR/url"
+    printf '%s\n' "$stream_id" > "$STATE_DIR/id"
+    printf '%s\n' "$start"     > "$STATE_DIR/start"
+    printf '%s\n' "$image"     > "$STATE_DIR/image"
+    touch "$STATE_DIR/active"
+
+    echo
+    echo "Nostr stream LIVE"
+    echo "  id:    $stream_id"
+    echo "  video: $url"
+    echo "  cover: $image"
+}
+
+stop_stream() {
+    [[ -e "$STATE_DIR/active" ]] || die "no active stream"
+
+    local url
+    local stream_id
+    local start
+    local end
+    local image
+
+    url="$(cat "$STATE_DIR/url")"
+    stream_id="$(cat "$STATE_DIR/id")"
+    start="$(cat "$STATE_DIR/start")"
+    end="$(date +%s)"
+
+    if [[ -s "$STATE_DIR/image" ]]; then
+        image="$(cat "$STATE_DIR/image")"
+    else
+        image="$FALLBACK_IMAGE"
+    fi
+
+    echo "Publishing Nostr ended event..."
+
+    if ! publish \
+        -k 30311 \
+        -d "$stream_id" \
+        -c '' \
+        -t "title=$TITLE" \
+        -t "summary=$SUMMARY" \
+        -t "streaming=$url" \
+        -t "recording=$url" \
+        -t "image=$image" \
+        -t "starts=$start" \
+        -t "ends=$end" \
+        -t 'status=ended' \
+        -t 't=bitcoin' \
+        -t 't=lightning' \
+        -t 't=goats'
+    then
+        die "could not publish ended event; active state preserved"
+    fi
+
+    rm -f \
+        "$STATE_DIR/active" \
+        "$STATE_DIR/url" \
+        "$STATE_DIR/id" \
+        "$STATE_DIR/start" \
+        "$STATE_DIR/image"
+
+    echo
+    echo "Nostr stream ENDED"
+    echo "  id:    $stream_id"
+    echo "  video: $url"
+    echo "  cover: $image"
+}
+
+status_stream() {
+    local image
+
+    if [[ ! -e "$STATE_DIR/active" ]]; then
+        echo "No stream is marked active."
+        return
+    fi
+
+    if [[ -s "$STATE_DIR/image" ]]; then
+        image="$(cat "$STATE_DIR/image")"
+    else
+        image="$FALLBACK_IMAGE"
+    fi
+
+    echo "Nostr stream LIVE"
+    echo "  id:    $(cat "$STATE_DIR/id")"
+    echo "  video: $(cat "$STATE_DIR/url")"
+    echo "  cover: $image"
+    echo "  start: $(cat "$STATE_DIR/start")"
+}
+
+check_config
+
+case "${1:-}" in
+    start)
+        [[ $# -eq 2 ]] || die "usage: nostr-stream start <stream-url>"
+        start_stream "$2"
+        ;;
+
+    stop)
+        [[ $# -eq 1 ]] || die "usage: nostr-stream stop"
+        stop_stream
+        ;;
+
+    status)
+        [[ $# -eq 1 ]] || die "usage: nostr-stream status"
+        status_stream
+        ;;
+
+    *)
+        echo "Usage:"
+        echo "  nostr-stream start <stream-url>"
+        echo "  nostr-stream stop"
+        echo "  nostr-stream status"
+        exit 2
+        ;;
+esac
