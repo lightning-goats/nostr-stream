@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+set -u
+umask 077
+
+CHANNEL="https://www.youtube.com/@lightning-goats/live"
+POLL_SECONDS=30
+OFFLINE_THRESHOLD=3
+
+YTDLP="$(command -v yt-dlp || true)"
+
+if [[ -x "$HOME/.local/bin/nostr-stream" ]]; then
+    NOSTR_STREAM="$HOME/.local/bin/nostr-stream"
+elif [[ -x "$HOME/bin/nostr-stream" ]]; then
+    NOSTR_STREAM="$HOME/bin/nostr-stream"
+else
+    echo "youtube-nostr-watch: cannot find nostr-stream" >&2
+    exit 1
+fi
+
+[[ -n "$YTDLP" ]] || {
+    echo "youtube-nostr-watch: yt-dlp not found in PATH" >&2
+    exit 1
+}
+
+STATE_DIR="$HOME/.local/state/youtube-nostr-watch"
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+ACTIVE_ID_FILE="$STATE_DIR/active-video-id"
+MISSES_FILE="$STATE_DIR/offline-count"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*"
+}
+
+get_misses() {
+    if [[ -r "$MISSES_FILE" ]]; then
+        cat "$MISSES_FILE"
+    else
+        echo 0
+    fi
+}
+
+set_misses() {
+    printf '%s\n' "$1" > "$MISSES_FILE"
+}
+
+nostr_is_active() {
+    "$NOSTR_STREAM" status 2>/dev/null |
+        grep -q '^Nostr stream LIVE$'
+}
+
+check_youtube() {
+    local output
+    local errfile
+    local rc
+
+    errfile="$(mktemp)"
+
+    output="$(
+        timeout 20s "$YTDLP" \
+            --no-warnings \
+            --print '%(live_status)s|%(id)s' \
+            "$CHANNEL" \
+            2>"$errfile"
+    )"
+    rc=$?
+
+    if [[ $rc -eq 0 && -n "$output" ]]; then
+        rm -f "$errfile"
+        printf '%s\n' "$output" | tail -n1
+        return 0
+    fi
+
+    if grep -qi 'not currently live' "$errfile"; then
+        rm -f "$errfile"
+        echo "OFFLINE|"
+        return 0
+    fi
+
+    log "YouTube check failed; leaving current Nostr state unchanged"
+    sed 's/^/  yt-dlp: /' "$errfile" >&2
+    rm -f "$errfile"
+
+    return 1
+}
+
+handle_live() {
+    local url="$1"
+    local video_id="$2"
+
+    set_misses 0
+
+    local old_id=""
+    [[ -r "$ACTIVE_ID_FILE" ]] && old_id="$(cat "$ACTIVE_ID_FILE")"
+
+    if [[ "$old_id" == "$video_id" ]]; then
+        if nostr_is_active; then
+            return
+        fi
+
+        log "YouTube is still live but Nostr stream is not active; restarting it"
+        rm -f "$ACTIVE_ID_FILE"
+        old_id=""
+    fi
+
+    if [[ -n "$old_id" ]]; then
+        log "Live video changed: $old_id -> $video_id"
+
+        if timeout 45s "$NOSTR_STREAM" stop; then
+            rm -f "$ACTIVE_ID_FILE"
+            log "Previous Nostr stream stopped"
+        else
+            log "Failed to stop previous Nostr stream"
+            return
+        fi
+    fi
+
+    log "YouTube LIVE detected: $video_id"
+    log "Starting Nostr stream: $url"
+
+    if timeout 45s "$NOSTR_STREAM" start "$url"; then
+        printf '%s\n' "$video_id" > "$ACTIVE_ID_FILE"
+        log "Nostr stream started"
+    else
+        log "Failed to start Nostr stream"
+    fi
+}
+
+handle_offline() {
+    if [[ ! -r "$ACTIVE_ID_FILE" ]]; then
+        set_misses 0
+        return
+    fi
+
+    local misses
+    misses="$(get_misses)"
+    misses=$((misses + 1))
+    set_misses "$misses"
+
+    log "YouTube offline check $misses/$OFFLINE_THRESHOLD"
+
+    if (( misses < OFFLINE_THRESHOLD )); then
+        return
+    fi
+
+    log "YouTube stream confirmed ended; stopping Nostr stream"
+
+    if ! nostr_is_active; then
+        log "Nostr stream is already inactive; clearing watcher state"
+        rm -f "$ACTIVE_ID_FILE"
+        set_misses 0
+        return
+    fi
+
+    if timeout 45s "$NOSTR_STREAM" stop; then
+        rm -f "$ACTIVE_ID_FILE"
+        set_misses 0
+        log "Nostr stream stopped"
+    else
+        log "Failed to stop Nostr stream; will retry"
+    fi
+}
+
+log "Watching $CHANNEL"
+
+while true; do
+    RESULT="$(check_youtube)" || {
+        sleep "$POLL_SECONDS"
+        continue
+    }
+
+    IFS='|' read -r STATUS VIDEO_ID <<< "$RESULT"
+
+    URL=""
+    if [[ -n "$VIDEO_ID" ]]; then
+        URL="https://www.youtube.com/watch?v=$VIDEO_ID"
+    fi
+
+    case "$STATUS" in
+        is_live)
+            if [[ -z "$VIDEO_ID" || -z "$URL" ]]; then
+                log "YouTube reported live status without a usable video ID; doing nothing"
+            else
+                handle_live "$URL" "$VIDEO_ID"
+            fi
+            ;;
+
+        OFFLINE|not_live|was_live|post_live|is_upcoming)
+            handle_offline
+            ;;
+
+        *)
+            log "Unknown YouTube status '$STATUS'; doing nothing"
+            ;;
+    esac
+
+    sleep "$POLL_SECONDS"
+done
