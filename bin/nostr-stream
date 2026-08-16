@@ -10,6 +10,7 @@ BUNKER_PUB_FILE="$HOME/.config/nak/bunker.pub"
 CLIENT_CRED="$HOME/.config/nak/credentials/nostr-client.cred"
 STATE_DIR="$HOME/.local/state/lightning-goats-stream"
 ANNOUNCEMENT_DIR="$STATE_DIR/announced"
+LAST_REFRESH_FILE="$STATE_DIR/last-refresh"
 
 FALLBACK_IMAGE="https://primaldata.s3.us-east-005.backblazeb2.com/cache/0/6c/63/06c633c820a33a891fa1f3ee248115d7c3accf3e44845da8cf4080a6a1c92c8b.png"
 
@@ -203,6 +204,27 @@ publish_announcement_event() {
     publish_with_relays announcement "$@"
 }
 
+publish_live_state() {
+    local url="$1"
+    local stream_id="$2"
+    local start="$3"
+    local image="$4"
+
+    publish_stream_event \
+        -k 30311 \
+        -d "$stream_id" \
+        -c '' \
+        -t "title=$TITLE" \
+        -t "summary=$SUMMARY" \
+        -t "streaming=$url" \
+        -t "image=$image" \
+        -t "starts=$start" \
+        -t 'status=live' \
+        -t 't=bitcoin' \
+        -t 't=lightning' \
+        -t 't=goats'
+}
+
 announce_stream() {
     local url="$1"
     local video_id
@@ -253,6 +275,7 @@ start_stream() {
     local start
     local stream_id
     local image
+    local now
 
     [[ ! -e "$STATE_DIR/active" ]] || \
         die "stream already active; use: nostr-stream status"
@@ -265,27 +288,16 @@ start_stream() {
     echo "Stream URL:  $url"
     echo "Cover image: $image"
 
-    if ! publish_stream_event \
-        -k 30311 \
-        -d "$stream_id" \
-        -c '' \
-        -t "title=$TITLE" \
-        -t "summary=$SUMMARY" \
-        -t "streaming=$url" \
-        -t "image=$image" \
-        -t "starts=$start" \
-        -t 'status=live' \
-        -t 't=bitcoin' \
-        -t 't=lightning' \
-        -t 't=goats'
-    then
+    if ! publish_live_state "$url" "$stream_id" "$start" "$image"; then
         die "could not publish live event"
     fi
 
+    now="$(date +%s)"
     printf '%s\n' "$url"       > "$STATE_DIR/url"
     printf '%s\n' "$stream_id" > "$STATE_DIR/id"
     printf '%s\n' "$start"     > "$STATE_DIR/start"
     printf '%s\n' "$image"     > "$STATE_DIR/image"
+    printf '%s\n' "$now"       > "$LAST_REFRESH_FILE"
     touch "$STATE_DIR/active"
 
     echo
@@ -300,6 +312,63 @@ start_stream() {
     if ! announce_stream "$url"; then
         echo "nostr-stream: live event is active; announcement will need retry" >&2
     fi
+}
+
+refresh_stream() {
+    [[ -e "$STATE_DIR/active" ]] || die "no active stream"
+
+    local url
+    local stream_id
+    local start
+    local image
+    local now
+
+    url="$(cat "$STATE_DIR/url")"
+    stream_id="$(cat "$STATE_DIR/id")"
+    start="$(cat "$STATE_DIR/start")"
+
+    if [[ -s "$STATE_DIR/image" ]]; then
+        image="$(cat "$STATE_DIR/image")"
+    else
+        image="$FALLBACK_IMAGE"
+    fi
+
+    echo "Refreshing Nostr live event..."
+
+    if ! publish_live_state "$url" "$stream_id" "$start" "$image"; then
+        echo "nostr-stream: live-event refresh failed" >&2
+        return 1
+    fi
+
+    now="$(date +%s)"
+    printf '%s\n' "$now" > "$LAST_REFRESH_FILE"
+    chmod 600 "$LAST_REFRESH_FILE"
+
+    echo "Nostr stream refreshed"
+    echo "  id:    $stream_id"
+    echo "  video: $url"
+}
+
+refresh_if_due() {
+    local minimum_age="${1:-1200}"
+    local now
+    local last=0
+
+    [[ "$minimum_age" =~ ^[0-9]+$ ]] || die "refresh interval must be seconds"
+    [[ -e "$STATE_DIR/active" ]] || return 0
+
+    if [[ -s "$LAST_REFRESH_FILE" ]]; then
+        last="$(cat "$LAST_REFRESH_FILE")"
+        [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    fi
+
+    now="$(date +%s)"
+
+    if (( now - last < minimum_age )); then
+        return 0
+    fi
+
+    refresh_stream
 }
 
 stop_stream() {
@@ -348,7 +417,8 @@ stop_stream() {
         "$STATE_DIR/url" \
         "$STATE_DIR/id" \
         "$STATE_DIR/start" \
-        "$STATE_DIR/image"
+        "$STATE_DIR/image" \
+        "$LAST_REFRESH_FILE"
 
     echo
     echo "Nostr stream ENDED"
@@ -362,6 +432,7 @@ status_stream() {
     local url
     local video_id
     local note_status="n/a"
+    local last_refresh="n/a"
 
     if [[ ! -e "$STATE_DIR/active" ]]; then
         echo "No stream is marked active."
@@ -385,12 +456,17 @@ status_stream() {
         fi
     fi
 
+    if [[ -s "$LAST_REFRESH_FILE" ]]; then
+        last_refresh="$(cat "$LAST_REFRESH_FILE")"
+    fi
+
     echo "Nostr stream LIVE"
-    echo "  id:    $(cat "$STATE_DIR/id")"
-    echo "  video: $url"
-    echo "  cover: $image"
-    echo "  start: $(cat "$STATE_DIR/start")"
-    echo "  note:  $note_status"
+    echo "  id:           $(cat "$STATE_DIR/id")"
+    echo "  video:        $url"
+    echo "  cover:        $image"
+    echo "  start:        $(cat "$STATE_DIR/start")"
+    echo "  last-refresh: $last_refresh"
+    echo "  note:         $note_status"
 }
 
 check_config
@@ -404,6 +480,16 @@ case "${1:-}" in
     stop)
         [[ $# -eq 1 ]] || die "usage: nostr-stream stop"
         stop_stream
+        ;;
+
+    refresh)
+        [[ $# -eq 1 ]] || die "usage: nostr-stream refresh"
+        refresh_stream
+        ;;
+
+    refresh-if-due)
+        [[ $# -le 2 ]] || die "usage: nostr-stream refresh-if-due [seconds]"
+        refresh_if_due "${2:-1200}"
         ;;
 
     announce)
@@ -420,6 +506,8 @@ case "${1:-}" in
         echo "Usage:"
         echo "  nostr-stream start <stream-url>"
         echo "  nostr-stream stop"
+        echo "  nostr-stream refresh"
+        echo "  nostr-stream refresh-if-due [seconds]"
         echo "  nostr-stream announce <youtube-url>"
         echo "  nostr-stream status"
         exit 2
