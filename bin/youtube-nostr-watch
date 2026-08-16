@@ -117,11 +117,10 @@ handle_live() {
 
     if [[ "$old_id" == "$video_id" ]]; then
         if nostr_is_active; then
-            # Both operations are idempotent/conditional. Announcement retries
-            # only until its per-video marker exists; refresh publishes only
-            # when the active 30311 is at least REFRESH_SECONDS old.
+            # `announce` is idempotent. Calling it on each successful live poll
+            # gives a failed initial kind-1 publication a chance to recover
+            # without ever intentionally creating a second note for this video.
             ensure_announcement "$url" || true
-            ensure_freshness || true
             return
         fi
 
@@ -196,6 +195,14 @@ handle_offline() {
 log "Watching $CHANNEL"
 
 while true; do
+    # Keep an already-active NIP-53 event fresh even if YouTube metadata is
+    # temporarily unavailable (for example a bot challenge or transient error).
+    # The conditional publisher performs no network work until the 20-minute
+    # refresh interval has elapsed.
+    if nostr_is_active; then
+        ensure_freshness || true
+    fi
+
     RESULT="$(check_youtube)" || {
         sleep "$POLL_SECONDS"
         continue
