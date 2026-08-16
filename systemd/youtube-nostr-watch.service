@@ -1,0 +1,18 @@
+[Unit]
+Description=Lightning Goats YouTube to Nostr Live Watcher
+Documentation=https://github.com/lightning-goats/nostr-stream
+Wants=network-online.target
+After=network-online.target nak-bunker.service
+Requires=nak-bunker.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/youtube-nostr-watch
+Restart=always
+RestartSec=10
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
