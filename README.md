@@ -8,7 +8,7 @@ For each distinct YouTube broadcast it also:
 
 - creates one NIP-75 `kind:9041` zap goal for **10,000 sats**;
 - links the zap goal from the `kind:30311` event;
-- publishes one regular `kind:1` announcement note;
+- publishes one regular `kind:1` announcement note that references the same zap goal;
 - retires the zap goal with a NIP-09 deletion request when YouTube is confirmed ended.
 
 The video itself remains hosted by YouTube. Nostr provides discovery, live-event metadata, zap-goal metadata, and the once-per-broadcast announcement.
@@ -23,7 +23,16 @@ https://youtu.be/VIDEO_ID
 #CyberHerd
 ```
 
-The event also carries `t=cyberherd` and relay-reference tags.
+The event also carries `t=cyberherd`, relay-reference tags, and—when the per-stream NIP-75 goal is available—references that same `kind:9041` goal using:
+
+```text
+["goal", "<9041-event-id>", "wss://nos.lol/"]
+["q", "<9041-event-id>", "wss://nos.lol/", "<goal-author-pubkey>"]
+```
+
+NIP-75 formally specifies the `goal` tag for addressable events such as `kind:30311`; clients are therefore not required to render zap-goal UI on a `kind:1` announcement. The `q` tag provides a standards-based event reference, while the additional `goal` tag gives clients that support goal discovery on regular notes the same goal ID.
+
+Kind-1 notes are immutable. If an announcement note was already published before this behavior was installed, the existing note is left alone rather than creating a duplicate solely to add these tags.
 
 ## NIP-75 zap goal
 
@@ -45,8 +54,12 @@ YouTube broadcast
       |          +--> persisted by YouTube video ID
       |
       +--> kind 30311 live event
+      |           |
+      |           +--> ["goal", "<9041-event-id>", "wss://nos.lol/"]
+      |
+      +--> kind 1 announcement
                   |
-                  +--> ["goal", "<9041-event-id>", "wss://nos.lol/"]
+                  +--> goal + q references to same 9041
 ```
 
 The feeder's own payment/cycle accounting remains authoritative. The NIP-75 goal represents Nostr-attributable zaps for the stream and is not used to actuate the feeder directly.
@@ -63,6 +76,7 @@ This means:
 
 - watcher restarts do not create another goal for the same YouTube video;
 - NIP-53 refreshes reuse the same goal;
+- the once-per-stream kind-1 announcement references the same stored goal;
 - a manual `nostr-stream stop` preserves the goal so watcher self-healing of a still-live YouTube broadcast reuses it;
 - when the watcher confirms that YouTube has ended, it calls `nostr-stream stop --delete-goal` and publishes a NIP-09 `kind:5` deletion request for the `kind:9041` goal.
 
@@ -263,7 +277,7 @@ Start a stream:
 nostr-stream start 'https://www.youtube.com/watch?v=VIDEO_ID'
 ```
 
-This creates or recovers the video-specific 10,000-sat zap goal, publishes the NIP-53 event linked to that goal, records local state, and attempts the regular kind-1 announcement.
+This creates or recovers the video-specific 10,000-sat zap goal, publishes the NIP-53 event linked to that goal, records local state, and attempts the regular kind-1 announcement referencing the same goal.
 
 Check state:
 
@@ -324,7 +338,7 @@ Default behavior:
 - polls YouTube every 30 seconds;
 - starts only when `yt-dlp` reports `live_status=is_live`;
 - creates one zap goal per YouTube video ID;
-- publishes one regular announcement per YouTube video ID;
+- publishes one regular announcement per YouTube video ID, referencing the same goal when available;
 - refreshes the active NIP-53 event every 20 minutes;
 - requires three consecutive confirmed-offline checks before ending Nostr;
 - treats extraction failures, DNS errors, timeouts, and YouTube bot challenges as indeterminate, not proof that the stream ended;
