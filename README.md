@@ -1,8 +1,16 @@
 # Lightning Goats Nostr Stream
 
-Self-hosted Nostr live-stream publishing for the Lightning Goats YouTube channel.
+Self-hosted Nostr live-stream publishing for the Lightning Goats YouTube channel and Lightning Goats HLS endpoint.
 
 This project watches the Lightning Goats YouTube channel, detects when a broadcast goes live, publishes a NIP-53 `kind:30311` live-stream event, keeps that event fresh while the broadcast is active, and updates it to `status=ended` when YouTube ends.
+
+Live Nostr playback uses the directly playable HLS endpoint:
+
+```text
+https://lightning-goats.com/hls/live_goats.m3u8
+```
+
+YouTube remains the broadcast identity, announcement link, zap-goal URL reference, and ended-stream recording URL.
 
 For each distinct YouTube broadcast it also:
 
@@ -11,7 +19,28 @@ For each distinct YouTube broadcast it also:
 - publishes one regular `kind:1` announcement note that references the same zap goal;
 - retires the zap goal with a NIP-09 deletion request when YouTube is confirmed ended.
 
-The video itself remains hosted by YouTube. Nostr provides discovery, live-event metadata, zap-goal metadata, and the once-per-broadcast announcement.
+## Playback model
+
+The live-event and announcement paths intentionally use different URLs:
+
+```text
+OBS / nginx
+   |
+   +--> YouTube live broadcast
+   |       |
+   |       +--> watcher identity / video ID
+   |       +--> kind-1 announcement link
+   |       +--> NIP-75 goal r tag
+   |       +--> ended 30311 recording tag
+   |
+   +--> Lightning Goats HLS
+           |
+           +--> https://lightning-goats.com/hls/live_goats.m3u8
+                  |
+                  +--> live 30311 streaming tag
+```
+
+This gives Nostr clients such as Primal a direct HLS media source while retaining YouTube as the durable archive and public promotional link.
 
 ## Announcement note
 
@@ -22,6 +51,8 @@ Zap Notes. Feed Goats.
 https://youtu.be/VIDEO_ID
 #CyberHerd
 ```
+
+The kind-1 note continues to point to YouTube rather than the HLS playlist.
 
 The event also carries `t=cyberherd`, relay-reference tags, and—when the per-stream NIP-75 goal is available—references that same `kind:9041` goal using:
 
@@ -55,10 +86,12 @@ YouTube broadcast
       |
       +--> kind 30311 live event
       |           |
-      |           +--> ["goal", "<9041-event-id>", "wss://nos.lol/"]
+      |           +--> HLS streaming URL
+      |           +--> goal reference
       |
       +--> kind 1 announcement
                   |
+                  +--> YouTube URL
                   +--> goal + q references to same 9041
 ```
 
@@ -88,6 +121,28 @@ A stored goal can also be retired manually:
 nostr-stream delete-goal 'https://www.youtube.com/watch?v=VIDEO_ID'
 ```
 
+## NIP-53 event lifecycle
+
+While live, `kind:30311` publishes:
+
+```text
+streaming=https://lightning-goats.com/hls/live_goats.m3u8
+status=live
+```
+
+along with the title, summary, image, original start timestamp, hashtags, and NIP-75 goal reference.
+
+When the YouTube broadcast ends, the same addressable event is updated with:
+
+```text
+streaming=https://lightning-goats.com/hls/live_goats.m3u8
+recording=https://www.youtube.com/watch?v=VIDEO_ID
+status=ended
+ends=<unix timestamp>
+```
+
+Clients should therefore use HLS for live playback and YouTube for replay/archive playback.
+
 ## NIP-53 freshness
 
 Live Activity management clients are expected to keep `kind:30311` events updated. The watcher therefore republishes the same addressable event every **20 minutes** while local state says the stream is active.
@@ -96,7 +151,8 @@ The refresh keeps the same:
 
 - `d` identifier;
 - title and summary;
-- YouTube streaming URL;
+- Lightning Goats HLS `streaming` URL;
+- YouTube broadcast identity in local state;
 - image;
 - original `starts` timestamp;
 - zap-goal event ID;
@@ -116,25 +172,26 @@ nostr-stream refresh-if-due 1200
 ## Components
 
 ```text
-YouTube @lightning-goats/live
-          |
-          v
-  youtube-nostr-watch
-          |
-          v
-      nostr-stream
-       /    |    \
-      /     |     \
- 30311    9041    kind 1
-      \     |     /
-       \    |    /
-          NIP-46
-            |
-            v
-        nak bunker
-            |
-            v
-       Nostr relays
+YouTube @lightning-goats/live      Lightning Goats HLS
+          |                              |
+          v                              |
+  youtube-nostr-watch                    |
+          |                              |
+          +--------------+---------------+
+                         v
+                    nostr-stream
+                    /    |    \
+                   /     |     \
+               30311    9041    kind 1
+                   \     |     /
+                    \    |    /
+                       NIP-46
+                         |
+                         v
+                     nak bunker
+                         |
+                         v
+                    Nostr relays
 ```
 
 Repository files:
@@ -271,13 +328,13 @@ sudo loginctl enable-linger "$USER"
 
 ## Manual operation
 
-Start a stream:
+Start a stream using the YouTube broadcast URL:
 
 ```bash
 nostr-stream start 'https://www.youtube.com/watch?v=VIDEO_ID'
 ```
 
-This creates or recovers the video-specific 10,000-sat zap goal, publishes the NIP-53 event linked to that goal, records local state, and attempts the regular kind-1 announcement referencing the same goal.
+The YouTube URL identifies the broadcast. `nostr-stream` creates or recovers the video-specific 10,000-sat zap goal, publishes the NIP-53 event with the Lightning Goats HLS playback URL, records local state, and attempts the regular kind-1 announcement pointing to YouTube.
 
 Check state:
 
@@ -290,7 +347,8 @@ Typical output includes:
 ```text
 Nostr stream LIVE
   id:           lightning-goats-...
-  video:        https://www.youtube.com/watch?v=...
+  streaming:    https://lightning-goats.com/hls/live_goats.m3u8
+  YouTube:      https://www.youtube.com/watch?v=...
   cover:        ...
   start:        ...
   last-refresh: ...
@@ -337,8 +395,10 @@ Default behavior:
 
 - polls YouTube every 30 seconds;
 - starts only when `yt-dlp` reports `live_status=is_live`;
+- uses the YouTube video ID as the per-broadcast identity;
+- publishes the Lightning Goats HLS URL as NIP-53 `streaming`;
 - creates one zap goal per YouTube video ID;
-- publishes one regular announcement per YouTube video ID, referencing the same goal when available;
+- publishes one regular announcement per YouTube video ID, pointing to YouTube and referencing the same goal when available;
 - refreshes the active NIP-53 event every 20 minutes;
 - requires three consecutive confirmed-offline checks before ending Nostr;
 - treats extraction failures, DNS errors, timeouts, and YouTube bot challenges as indeterminate, not proof that the stream ended;
