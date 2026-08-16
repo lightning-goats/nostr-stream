@@ -1,0 +1,27 @@
+[Unit]
+Description=Lightning Goats Nostr NIP-46 Bunker
+Documentation=https://github.com/lightning-goats/nostr-stream
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+
+LoadCredentialEncrypted=nostr-key:%h/.config/nak/credentials/nostr-key.cred
+
+ExecStart=%h/.local/libexec/nak-bunker
+
+Restart=on-failure
+RestartSec=10
+
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/nak
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=default.target
