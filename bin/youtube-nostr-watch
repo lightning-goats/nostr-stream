@@ -50,6 +50,17 @@ nostr_is_active() {
         grep -q '^Nostr stream LIVE$'
 }
 
+ensure_announcement() {
+    local url="$1"
+
+    if ! timeout 45s "$NOSTR_STREAM" announce "$url"; then
+        log "Failed to publish stream announcement note; will retry"
+        return 1
+    fi
+
+    return 0
+}
+
 check_youtube() {
     local output
     local errfile
@@ -96,6 +107,10 @@ handle_live() {
 
     if [[ "$old_id" == "$video_id" ]]; then
         if nostr_is_active; then
+            # `announce` is idempotent. Calling it on each successful live poll
+            # gives a failed initial kind-1 publication a chance to recover
+            # without ever intentionally creating a second note for this video.
+            ensure_announcement "$url" || true
             return
         fi
 
@@ -122,6 +137,11 @@ handle_live() {
     if timeout 45s "$NOSTR_STREAM" start "$url"; then
         printf '%s\n' "$video_id" > "$ACTIVE_ID_FILE"
         log "Nostr stream started"
+
+        # start attempts this itself, but this extra idempotent call ensures the
+        # watcher owns retries if the promotional note failed while the NIP-53
+        # live event succeeded.
+        ensure_announcement "$url" || true
     else
         log "Failed to start Nostr stream"
     fi
