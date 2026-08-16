@@ -383,6 +383,9 @@ announce_stream() {
     local short_url
     local marker
     local content
+    local goal_id=""
+    local author_pub=""
+    local -a goal_args=()
 
     video_id="$(extract_youtube_id "$url" 2>/dev/null || true)"
     [[ -n "$video_id" ]] || die "announcement requires a YouTube stream URL"
@@ -394,6 +397,22 @@ announce_stream() {
         return 0
     fi
 
+    if [[ -s "$GOAL_DIR/$video_id" ]]; then
+        goal_id="$(tr -d '\r\n' < "$GOAL_DIR/$video_id")"
+        if [[ "$goal_id" =~ ^[0-9a-f]{64}$ ]]; then
+            author_pub="$(tr -d '\r\n' < "$BUNKER_PUB_FILE")"
+            goal_args=(-t "goal=$goal_id;$GOAL_RELAY_HINT")
+
+            if [[ "$author_pub" =~ ^[0-9a-f]{64}$ ]]; then
+                goal_args+=(
+                    -t "q=$goal_id;$GOAL_RELAY_HINT;$author_pub"
+                )
+            fi
+        else
+            goal_id=""
+        fi
+    fi
+
     short_url="https://youtu.be/$video_id"
     content="${ANNOUNCEMENT_TEXT}"$'\n'"${short_url}"$'\n'"${ANNOUNCEMENT_HASHTAG}"
 
@@ -401,6 +420,7 @@ announce_stream() {
     echo "  $ANNOUNCEMENT_TEXT"
     echo "  $short_url"
     echo "  $ANNOUNCEMENT_HASHTAG"
+    [[ -z "$goal_id" ]] || echo "  goal: $goal_id"
 
     if ! publish_announcement_event \
         -k 1 \
@@ -409,6 +429,7 @@ announce_stream() {
         -t 'r=wss://nos.lol/' \
         -t 'r=wss://nostr.chaima.info/' \
         -t 'r=wss://relay.damus.io/' \
+        "${goal_args[@]}" \
         -t 't=cyberherd' \
         -t 'client=nostr-stream'
     then
