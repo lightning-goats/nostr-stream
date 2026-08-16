@@ -9,19 +9,31 @@ CURL="$(command -v curl || true)"
 BUNKER_PUB_FILE="$HOME/.config/nak/bunker.pub"
 CLIENT_CRED="$HOME/.config/nak/credentials/nostr-client.cred"
 STATE_DIR="$HOME/.local/state/lightning-goats-stream"
+ANNOUNCEMENT_DIR="$STATE_DIR/announced"
 
 FALLBACK_IMAGE="https://primaldata.s3.us-east-005.backblazeb2.com/cache/0/6c/63/06c633c820a33a891fa1f3ee248115d7c3accf3e44845da8cf4080a6a1c92c8b.png"
 
 TITLE="⚡ Lightning Goats ⚡ Live Goat Feeder"
 SUMMARY="Welcome to the Lightning Goats, the world’s first Bitcoin-powered interactive goat feeder! From morning to evening Mountain Time (GMT -7), you can send sats to treat the herd. When the feeder reaches 100%, it automatically dispenses goodies for the goats."
+ANNOUNCEMENT_TEXT="Zap Notes. Feed Goats."
 
+# Try these individually for NIP-46 RPC.
 BUNKER_RELAYS=(
     "nos.lol"
     "relay.damus.io"
 )
 
+# Relays used for NIP-53 live-event publication.
 PUBLISH_RELAYS=(
     "nos.lol"
+    "relay.damus.io"
+)
+
+# Relays used for the once-per-YouTube-stream kind-1 announcement note.
+ANNOUNCEMENT_RELAYS=(
+    "lnb.bolverker.com/nostrrelay/666"
+    "nos.lol"
+    "nostr.chaima.info"
     "relay.damus.io"
 )
 
@@ -39,8 +51,8 @@ check_config() {
     [[ -s "$BUNKER_PUB_FILE" ]] || die "missing $BUNKER_PUB_FILE"
     [[ -s "$CLIENT_CRED" ]] || die "missing $CLIENT_CRED"
 
-    mkdir -p "$STATE_DIR"
-    chmod 700 "$STATE_DIR"
+    mkdir -p "$STATE_DIR" "$ANNOUNCEMENT_DIR"
+    chmod 700 "$STATE_DIR" "$ANNOUNCEMENT_DIR"
 }
 
 bunker_uri() {
@@ -60,16 +72,33 @@ load_client_key() {
         "$CLIENT_CRED" -
 }
 
+extract_youtube_id() {
+    local url="$1"
+
+    if [[ "$url" =~ [\?\&]v=([A-Za-z0-9_-]{11}) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    if [[ "$url" =~ youtu\.be/([A-Za-z0-9_-]{11}) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    if [[ "$url" =~ youtube\.com/(embed|shorts|live)/([A-Za-z0-9_-]{11}) ]]; then
+        printf '%s\n' "${BASH_REMATCH[2]}"
+        return 0
+    fi
+
+    return 1
+}
+
 resolve_cover_image() {
     local url="$1"
     local video_id=""
     local image=""
 
-    if [[ "$url" =~ [\?\&]v=([^&]+) ]]; then
-        video_id="${BASH_REMATCH[1]}"
-    elif [[ "$url" =~ youtu\.be/([^/?]+) ]]; then
-        video_id="${BASH_REMATCH[1]}"
-    fi
+    video_id="$(extract_youtube_id "$url" 2>/dev/null || true)"
 
     if [[ -n "$video_id" ]]; then
         image="https://i.ytimg.com/vi/${video_id}/maxresdefault.jpg"
@@ -106,10 +135,26 @@ resolve_cover_image() {
     printf '%s\n' "$FALLBACK_IMAGE"
 }
 
-publish() {
+publish_with_relays() {
+    local relay_group="$1"
+    shift
+
+    local -a target_relays
     local relay
     local bunker
     local rc
+
+    case "$relay_group" in
+        stream)
+            target_relays=("${PUBLISH_RELAYS[@]}")
+            ;;
+        announcement)
+            target_relays=("${ANNOUNCEMENT_RELAYS[@]}")
+            ;;
+        *)
+            die "unknown relay group: $relay_group"
+            ;;
+    esac
 
     NOSTR_CLIENT_KEY="$(load_client_key)"
     export NOSTR_CLIENT_KEY
@@ -128,7 +173,7 @@ publish() {
             "$NAK" --connect-timeout 5s event \
                 --sec "$bunker" \
                 "$@" \
-                "${PUBLISH_RELAYS[@]}"
+                "${target_relays[@]}"
 
         rc=$?
         set -e
@@ -149,6 +194,57 @@ publish() {
     return 1
 }
 
+publish_stream_event() {
+    publish_with_relays stream "$@"
+}
+
+publish_announcement_event() {
+    publish_with_relays announcement "$@"
+}
+
+announce_stream() {
+    local url="$1"
+    local video_id
+    local short_url
+    local marker
+    local content
+
+    video_id="$(extract_youtube_id "$url" 2>/dev/null || true)"
+    [[ -n "$video_id" ]] || die "announcement requires a YouTube stream URL"
+
+    marker="$ANNOUNCEMENT_DIR/$video_id"
+
+    if [[ -e "$marker" ]]; then
+        echo "Announcement note already published for YouTube video $video_id"
+        return 0
+    fi
+
+    short_url="https://youtu.be/$video_id"
+    content="${ANNOUNCEMENT_TEXT}"$'\n'"${short_url}"
+
+    echo "Publishing once-per-stream Nostr note..."
+    echo "  $ANNOUNCEMENT_TEXT"
+    echo "  $short_url"
+
+    if ! publish_announcement_event \
+        -k 1 \
+        -c "$content" \
+        -t 'r=wss://lnb.bolverker.com/nostrrelay/666' \
+        -t 'r=wss://nos.lol/' \
+        -t 'r=wss://nostr.chaima.info/' \
+        -t 'r=wss://relay.damus.io/' \
+        -t 'client=nostr-stream'
+    then
+        echo "nostr-stream: announcement note publication failed" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$(date +%s)" > "$marker"
+    chmod 600 "$marker"
+
+    echo "Announcement note published for YouTube video $video_id"
+}
+
 start_stream() {
     local url="$1"
     local start
@@ -166,7 +262,7 @@ start_stream() {
     echo "Stream URL:  $url"
     echo "Cover image: $image"
 
-    if ! publish \
+    if ! publish_stream_event \
         -k 30311 \
         -d "$stream_id" \
         -c '' \
@@ -194,6 +290,13 @@ start_stream() {
     echo "  id:    $stream_id"
     echo "  video: $url"
     echo "  cover: $image"
+
+    # The live-event publication succeeded, so a failure to publish the
+    # promotional kind-1 note must not roll back the live state. The watcher
+    # will retry `announce` on later polls until the marker is written.
+    if ! announce_stream "$url"; then
+        echo "nostr-stream: live event is active; announcement will need retry" >&2
+    fi
 }
 
 stop_stream() {
@@ -218,7 +321,7 @@ stop_stream() {
 
     echo "Publishing Nostr ended event..."
 
-    if ! publish \
+    if ! publish_stream_event \
         -k 30311 \
         -d "$stream_id" \
         -c '' \
@@ -253,11 +356,16 @@ stop_stream() {
 
 status_stream() {
     local image
+    local url
+    local video_id
+    local note_status="n/a"
 
     if [[ ! -e "$STATE_DIR/active" ]]; then
         echo "No stream is marked active."
         return
     fi
+
+    url="$(cat "$STATE_DIR/url")"
 
     if [[ -s "$STATE_DIR/image" ]]; then
         image="$(cat "$STATE_DIR/image")"
@@ -265,11 +373,21 @@ status_stream() {
         image="$FALLBACK_IMAGE"
     fi
 
+    video_id="$(extract_youtube_id "$url" 2>/dev/null || true)"
+    if [[ -n "$video_id" ]]; then
+        if [[ -e "$ANNOUNCEMENT_DIR/$video_id" ]]; then
+            note_status="published"
+        else
+            note_status="pending"
+        fi
+    fi
+
     echo "Nostr stream LIVE"
     echo "  id:    $(cat "$STATE_DIR/id")"
-    echo "  video: $(cat "$STATE_DIR/url")"
+    echo "  video: $url"
     echo "  cover: $image"
     echo "  start: $(cat "$STATE_DIR/start")"
+    echo "  note:  $note_status"
 }
 
 check_config
@@ -285,6 +403,11 @@ case "${1:-}" in
         stop_stream
         ;;
 
+    announce)
+        [[ $# -eq 2 ]] || die "usage: nostr-stream announce <youtube-url>"
+        announce_stream "$2"
+        ;;
+
     status)
         [[ $# -eq 1 ]] || die "usage: nostr-stream status"
         status_stream
@@ -294,6 +417,7 @@ case "${1:-}" in
         echo "Usage:"
         echo "  nostr-stream start <stream-url>"
         echo "  nostr-stream stop"
+        echo "  nostr-stream announce <youtube-url>"
         echo "  nostr-stream status"
         exit 2
         ;;
