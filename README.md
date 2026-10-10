@@ -1,5 +1,113 @@
 # Lightning Goats Nostr Stream
 
+## OBS with local nginx and zap.stream
+
+The `--zap` installation mode uses this route:
+
+```text
+OBS (NVENC, 1080p30, 3 Mbps) -> nginx on localhost:1935/local/lightning-goats
+                              |-> native RTMP push -> YouTube
+                              |-> native RTMP push -> zap.stream -> HLS / NIP-53
+```
+
+`nostr-stream zap` authenticates API requests through the local NIP-46 bunker.
+The identity nsec stays in the bunker. The client credential must match
+`~/.config/nak/authorized-client.pub`.
+
+```bash
+./install.sh --zap
+sudo install -m 755 bin/lightning-goats-nginx-routes /usr/local/libexec/
+nostr-stream zap account
+nostr-stream zap metadata --file ~/.config/nostr-stream/zap-metadata.json
+nostr-stream zap metadata --file metadata.json --stream-id ZAP_STREAM_UUID
+nostr-stream zap sync-ingest
+lightning-goats-obs --check
+```
+
+The account command redacts ingest keys. `sync-ingest` fetches the current Basic
+endpoint and key from zap.stream and passes them on stdin to the root-owned
+`/usr/local/libexec/lightning-goats-nginx-routes` updater. It preserves the YouTube
+key from `~/.config/nostr-stream/youtube-service.json` (mode 600). Update that file
+when rotating the YouTube key, or set a new YouTube destination in OBS before
+closing it; the launcher captures that key before restoring the nginx route.
+The zap.stream API does not provide YouTube credentials.
+
+The updater accepts only YouTube's ingest host and `*.zap.stream`, writes
+`/etc/nginx/stream-destinations.conf` with mode 600, validates nginx, and reloads
+it when a destination changes. A lock serializes updates. Failed validation
+restores the previous file; a failed reload also reapplies the previous running
+configuration. Keys remain in this root-owned file, outside process arguments.
+
+Include that file inside nginx's `application local` block. Keep the RTMP
+listener on loopback and use one worker, `chunk_size 4096`, `push_reconnect 1s`,
+`idle_streams off`, `wait_key on`, `wait_video on`, and `meta publish`. Disable
+RTMP access logging with `access_log off` in the `rtmp` block.
+OBS provides the only video encoding, using NVIDIA NVENC. Nginx forwards the
+same encoded video and audio directly to both endpoints without transcoding,
+remux processes, or custom publishers. The launcher uses NVIDIA PRIME with
+XWayland (`XDG_SESSION_TYPE=x11`, `QT_QPA_PLATFORM=xcb`) so this OBS Snap
+selects the NVIDIA GPU for scene rendering as well as NVENC encoding. The
+interface stays on the laptop display. Native Wayland selected Intel on this
+host despite PRIME variables; verify the selected adapter in the startup log.
+The host uses the existing Balanced power profile (`powerprofilesctl set balanced`)
+to reduce CPU heat while keeping NVIDIA rendering and encoding active. In
+Performance mode, the CPU repeatedly exceeded 90°C with intermittent missed frames.
+
+The host uses the kernel's installed BBR TCP congestion control. With CUBIC,
+the UK zap ingest connection accumulated about 750 KB of unsent data and nginx
+dropped frames. A two-minute BBR check held 30 fps with no relay or OBS drops;
+public zap video had regular 33 ms frame timestamps. Install the existing
+sysctl configuration to preserve this across boots:
+
+```sh
+sudo install -m 644 config/90-lightning-goats-stream.conf /etc/sysctl.d/
+sudo sysctl -p /etc/sysctl.d/90-lightning-goats-stream.conf
+```
+
+It applies to new TCP connections on this host. Existing nginx connections
+need one brief reconnect when switching algorithms. The kernel autoloads the
+installed `tcp_bbr` module. Retain the existing `fq_codel` queue discipline.
+To revert, remove this file and run
+`sudo sysctl -w net.ipv4.tcp_congestion_control=cubic`; reconnect nginx only
+when needed to change its established sockets.
+
+The installed nginx RTMP module needs the small compatibility patch in
+`nginx/rtmp-publish-metadata.patch`. Standard `meta on` and `meta copy` strip
+`@setDataFrame`, but zap.stream's RTMP receiver requires that envelope before
+it initializes its FLV input. The patch adds opt-in `meta publish`, retaining
+normal metadata behavior for other applications. Build it against the exact
+installed nginx version with `--with-compat`; validate an isolated nginx
+instance and its outgoing metadata before deployment. Rebuild the module after
+nginx upgrades. Keep the distribution module and prior configuration for rollback.
+
+Enable `nak-bunker.service` and `nostr-stream-zap.service`. Leave
+`youtube-nostr-watch.service` disabled in this mode to avoid another live event.
+The zap watcher observes nginx's actual publisher, waits for the current YouTube
+broadcast and zap.stream event, creates/reuses one goal and announcement, then
+updates that existing event's metadata and goal. It refreshes metadata every 20
+minutes and retires the goal after three consecutive confirmed YouTube offline
+checks. Older broadcasts remain tracked across restarts until their individual
+YouTube URLs are confirmed ended; transient failures reset confirmation counts.
+zap.stream owns live/ended status and the playback URL. The watcher accepts
+its UK regional service address and chooses HTTPS playback when events also
+advertise another transport.
+
+The zap installer wires desktop and login launchers to `lightning-goats-obs`. It refreshes ingest
+destinations, initializes metadata, restores OBS's local nginx destination, and
+launches OBS with streaming enabled. Existing OBS service settings are backed
+up privately before replacement. Close and reopen an already-running OBS
+instance to load the new service settings. The launcher selects the uniquely
+named `Lightning Goats` scene collection and the `Untitled` profile. Preserve
+the camera and overlay in that collection. To open a stopped preview during
+repairs, create `~/.config/nostr-stream/hold-stream`; remove it after verifying
+the picture to restore automatic streaming on startup.
+
+Run regression tests with `python3 -m unittest discover -s tests -v`. The tests
+use generated, disposable identities and local HTTP fixtures; they do not
+publish public events or use deployment credentials.
+
+## Original YouTube watcher with self-hosted HLS
+
 Self-hosted Nostr live-stream publishing for the Lightning Goats YouTube channel and Lightning Goats HLS endpoint.
 
 This project watches the Lightning Goats YouTube channel, detects when a broadcast goes live, publishes a NIP-53 `kind:30311` live-stream event, keeps that event fresh while the broadcast is active, and updates it to `status=ended` when YouTube ends.

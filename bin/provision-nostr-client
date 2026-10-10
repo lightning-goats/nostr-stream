@@ -1,0 +1,83 @@
+#!/usr/bin/python3
+"""Interactively provision an approved NIP-46 client as a systemd credential."""
+
+import argparse
+import getpass
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+
+APPROVED_CLIENT = "5302cd2bfe2dcc76c5a9abcba74e6c5f1a07444b35c25e0cd74bac5b453fb5f6"
+
+
+class CredentialError(Exception):
+    pass
+
+
+def save_credential(destination, encrypted):
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=".nostr-client-", dir=destination.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(encrypted)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def provision(key, approved, destination, nak):
+    key = key.strip()
+    result = subprocess.run([str(nak), "key", "public"], input=key.encode(),
+                            capture_output=True, timeout=10)
+    if result.returncode or result.stdout.decode().strip() != approved:
+        raise CredentialError("This private key does not match the approved client public key.")
+    result = subprocess.run(
+        ["sudo", "-n", "systemd-creds", "encrypt", "--user", f"--uid={os.getuid()}",
+         "--with-key=host", "--name=nostr-client", "-", "-"],
+        input=key.encode(), capture_output=True, timeout=30)
+    if result.returncode:
+        raise CredentialError("Credential encryption failed. Check that sudo -n true succeeds.")
+    encrypted = result.stdout
+    check = subprocess.run(
+        ["systemd-creds", "decrypt", "--user", "--name=nostr-client", "-", "-"],
+        input=encrypted, capture_output=True, timeout=30)
+    if check.returncode or check.stdout != key.encode():
+        raise CredentialError("Encrypted credential verification failed; nothing was saved.")
+    save_credential(destination, encrypted)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.parse_args()
+    home = Path.home()
+    authorized = home / ".config/nak/authorized-client.pub"
+    if not authorized.is_file() or authorized.read_text().strip() != APPROVED_CLIENT:
+        raise CredentialError("The bunker allowlist does not match the approved client.")
+    if not sys.stdin.isatty():
+        raise CredentialError("Run this script in an interactive terminal on the streaming host.")
+    print(f"Expected client public key: {APPROVED_CLIENT}")
+    print("Enter the CLIENT private key (nsec or hex). Input will be hidden.")
+    key = getpass.getpass("Client private key: ")
+    destination = home / ".config/nak/credentials/nostr-client.cred"
+    provision(key, APPROVED_CLIENT, destination, home / ".local/bin/nak")
+    print(f"Credential verified and saved with mode 600: {destination}")
+    print("The bunker's existing signing credential was left unchanged.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (CredentialError, OSError, subprocess.SubprocessError) as error:
+        # Never emit subprocess stdout/stderr: they may contain key material.
+        message = str(error) if isinstance(error, CredentialError) else type(error).__name__
+        print(f"provision-nostr-client: {message}", file=sys.stderr)
+        sys.exit(1)
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled; no credential was saved.", file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,125 @@
+#!/usr/bin/python3
+"""Restore the local nginx destination before starting the Lightning Goats stream."""
+
+import argparse
+import datetime
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+
+
+def capture_youtube_profile(profile, destination):
+    data = profile.read_bytes()
+    current = json.loads(data)
+    settings = current.get("settings", {})
+    hostname = urllib.parse.urlsplit(settings.get("server", "")).hostname
+    if hostname not in {"a.rtmp.youtube.com", "a.rtmps.youtube.com", "b.rtmp.youtube.com", "b.rtmps.youtube.com"}:
+        return
+    if not settings.get("key"):
+        raise RuntimeError("The selected YouTube profile has no stream key.")
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, name = tempfile.mkstemp(dir=destination.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(data)
+        os.replace(name, destination)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def configure_profile(profile, backups):
+    original = profile.read_bytes()
+    json.loads(original)  # Reject a damaged profile before replacing it.
+    desired = {"type": "rtmp_custom", "settings": {
+        "server": "rtmp://127.0.0.1:1935/local", "key": "lightning-goats", "use_auth": False}}
+    if json.loads(original) == desired:
+        return
+    backups.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    backup = backups / f"service-{stamp}.json"
+    with backup.open("xb") as output:
+        os.fchmod(output.fileno(), 0o600)
+        output.write(original)
+    descriptor, name = tempfile.mkstemp(dir=profile.parent)
+    try:
+        with os.fdopen(descriptor, "w") as output:
+            os.fchmod(output.fileno(), 0o600)
+            json.dump(desired, output, indent=2)
+            output.write("\n")
+        os.replace(name, profile)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def obs_environment(desktop):
+    environment = dict(desktop)
+    environment["__NV_PRIME_RENDER_OFFLOAD"] = "1"
+    environment["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
+    # The Snap can initialize NVIDIA EGL on XWayland; Wayland selects Intel.
+    environment["XDG_SESSION_TYPE"] = "x11"
+    environment["QT_QPA_PLATFORM"] = "xcb"
+    return environment
+
+
+def obs_arguments(hold):
+    arguments = ["/snap/bin/obs-studio", "--profile", "Untitled",
+                 "--collection", "Lightning Goats"]
+    if not hold:
+        arguments.append("--startstreaming")
+    return arguments
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="Verify readiness without launching OBS")
+    args = parser.parse_args()
+    home = Path.home()
+    profile = home / "snap/obs-studio/common/.config/obs-studio/basic/profiles/Untitled/service.json"
+    hold = (home / ".config/nostr-stream/hold-stream").exists()
+    if hold:
+        if args.check:
+            print("Streaming is held for preview verification.")
+            return
+        os.execve("/snap/bin/obs-studio", obs_arguments(True), obs_environment(os.environ))
+    capture_youtube_profile(profile, home / ".config/nostr-stream/youtube-service.json")
+    deadline = time.monotonic() + 20
+    while True:
+        try:
+            with socket.create_connection(("127.0.0.1", 1935), timeout=1):
+                break
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("nginx is not listening on localhost:1935; OBS was not launched.")
+            time.sleep(1)
+    # Metadata is initialized before zap.stream creates the new live event.
+    result = subprocess.run(
+        [str(home / ".local/bin/nostr-stream"), "zap", "sync-ingest"],
+        capture_output=True, timeout=100)
+    if result.returncode:
+        raise RuntimeError("Refreshing nginx's ingest destinations failed; OBS was not launched.")
+    result = subprocess.run(
+        [str(home / ".local/bin/nostr-stream"), "zap", "metadata", "--file",
+         str(home / ".config/nostr-stream/zap-metadata.json")], capture_output=True, timeout=90)
+    if result.returncode:
+        raise RuntimeError("zap.stream metadata initialization failed; OBS was not launched.")
+    configure_profile(profile, home / ".local/state/obs-config-backups/launcher")
+    if args.check:
+        print("nginx routing and zap.stream metadata are ready; OBS was not launched.")
+        return
+    os.execve("/snap/bin/obs-studio", obs_arguments(False), obs_environment(os.environ))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        message = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+        print(f"lightning-goats-obs: {message}", file=sys.stderr)
+        sys.exit(1)

@@ -2,6 +2,13 @@
 set -Eeuo pipefail
 umask 077
 
+if [[ "${1:-}" == zap ]]; then
+    shift
+    ZAP_HELPER="$(dirname -- "${BASH_SOURCE[0]}")/nostr-stream-zap"
+    [[ -f "$ZAP_HELPER" ]] || ZAP_HELPER="$HOME/.local/libexec/nostr-stream-zap"
+    exec python3 "$ZAP_HELPER" "$@"
+fi
+
 NAK="$(command -v nak || true)"
 SYSTEMD_CREDS="$(command -v systemd-creds || true)"
 CURL="$(command -v curl || true)"
@@ -188,7 +195,7 @@ publish_with_relays() {
                 --signal=TERM \
                 --kill-after=2s \
                 15s \
-                "$NAK" --connect-timeout 5s event \
+                "$NAK" --connect-timeout 5s event --github \
                     --sec "$bunker" \
                     "$@" \
                     "${target_relays[@]}" \
@@ -706,6 +713,12 @@ status_stream() {
 check_config
 
 case "${1:-}" in
+    prepare)
+        [[ $# -eq 2 ]] || die "usage: nostr-stream prepare <youtube-url>"
+        ensure_goal "$2" "$(resolve_cover_image "$2")" || die "could not prepare zap goal"
+        announce_stream "$2"
+        ;;
+
     start)
         [[ $# -eq 2 ]] || die "usage: nostr-stream start <stream-url>"
         start_stream "$2"
@@ -748,6 +761,8 @@ case "${1:-}" in
 
     *)
         echo "Usage:"
+        echo "  nostr-stream zap {account,metadata,watch} [options]"
+        echo "  nostr-stream prepare <youtube-url>"
         echo "  nostr-stream start <stream-url>"
         echo "  nostr-stream stop [--delete-goal]"
         echo "  nostr-stream refresh"
