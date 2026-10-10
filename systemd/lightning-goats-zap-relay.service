@@ -1,0 +1,22 @@
+[Unit]
+Description=Lightning Goats nginx feed to zap.stream remux relay
+After=network-online.target nginx.service
+Wants=network-online.target
+Requires=nginx.service
+
+[Service]
+Type=simple
+User=goats
+Group=goats
+LoadCredential=routes:/etc/nginx/stream-destinations.conf
+ExecStart=/usr/local/libexec/lightning-goats-zap-relay
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

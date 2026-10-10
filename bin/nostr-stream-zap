@@ -1,0 +1,451 @@
+#!/usr/bin/python3
+"""Use zap.stream's API with the existing local NIP-46 bunker."""
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import xml.etree.ElementTree as ET
+
+
+API_URL = "https://api-core.zap.stream/api/v1"
+RELAYS = ("wss://nos.lol", "wss://relay.damus.io")
+METADATA_FIELDS = {"title", "summary", "image", "tags", "content_warning", "goal"}
+
+
+class ZapError(Exception):
+    pass
+
+
+def validate_metadata(value):
+    if not isinstance(value, dict) or set(value) - METADATA_FIELDS:
+        raise ValueError("Metadata must contain only title, summary, image, tags, content_warning or goal.")
+    for name, data in value.items():
+        if name == "tags":
+            if not isinstance(data, list) or not all(isinstance(tag, str) for tag in data):
+                raise ValueError("Metadata tags must be a list of strings.")
+        elif not isinstance(data, str):
+            raise ValueError(f"Metadata {name} must be a string.")
+    return dict(value)
+
+
+def redact(value):
+    if isinstance(value, dict):
+        return {key: "<redacted>" if re.search(r"key|secret|password|token|nwc", key, re.I)
+                else redact(data) for key, data in value.items()}
+    if isinstance(value, list):
+        return [redact(data) for data in value]
+    return value
+
+
+def ingest_destinations(account, youtube):
+    endpoints = [endpoint for endpoint in account.get("endpoints", [])
+                 if endpoint.get("name") == "RTMP-Basic"]
+    if len(endpoints) != 1:
+        raise ZapError("The zap.stream account did not return one Basic ingest endpoint.")
+    endpoint = endpoints[0]
+    return {"youtube": {"server": "rtmp://a.rtmp.youtube.com/live2", "key": youtube["settings"]["key"]},
+            "zap": {"server": endpoint["url"], "key": endpoint["key"]}}
+
+
+class RemoteSigner:
+    def __init__(self, home):
+        self.nak = home / ".local/bin/nak"
+        config = home / ".config/nak"
+        self.public_key = (config / "bunker.pub").read_text().strip()
+        approved = (config / "authorized-client.pub").read_text().strip()
+        if not all(re.fullmatch(r"[0-9a-f]{64}", key) for key in (self.public_key, approved)):
+            raise ZapError("Invalid bunker or client public key configuration.")
+        runtime = os.environ.get("CREDENTIALS_DIRECTORY")
+        if runtime and (Path(runtime) / "nostr-client").is_file():
+            client = (Path(runtime) / "nostr-client").read_bytes()
+        else:
+            result = subprocess.run(
+                ["systemd-creds", "decrypt", "--user", "--name=nostr-client",
+                 str(config / "credentials/nostr-client.cred"), "-"],
+                capture_output=True, timeout=15)
+            if result.returncode:
+                raise ZapError("Cannot load nostr-client.cred; run provision-nostr-client first.")
+            client = result.stdout
+        result = subprocess.run([str(self.nak), "key", "public"], input=client,
+                                capture_output=True, timeout=10)
+        if result.returncode or result.stdout.decode().strip() != approved:
+            raise ZapError("Client credential does not match the bunker allowlist.")
+        self.environment = os.environ.copy()
+        self.environment.pop("NOSTR_SECRET_KEY", None)
+        self.environment["NOSTR_CLIENT_KEY"] = client.decode().strip()
+
+    def sign(self, tags):
+        for relay in RELAYS:
+            bunker = (f"bunker://{self.public_key}?relay="
+                      + urllib.parse.quote(relay, safe=""))
+            command = [str(self.nak), "event", "--github", "--sec", bunker,
+                       "-k", "27235", "-c", ""]
+            for name, value in tags:
+                command += ["-t", f"{name}={value}"]
+            try:
+                result = subprocess.run(command, input="", capture_output=True,
+                                        text=True, env=self.environment, timeout=35)
+                event = json.loads(result.stdout) if result.returncode == 0 else {}
+            except (subprocess.TimeoutExpired, json.JSONDecodeError):
+                continue
+            if (event.get("pubkey") == self.public_key and event.get("kind") == 27235
+                    and event.get("tags") == tags and event.get("content") == ""):
+                return event
+        raise ZapError("Bunker signing failed on both relays; private diagnostics suppressed.")
+
+
+class ZapApi:
+    def __init__(self, base_url, sign):
+        parts = urllib.parse.urlsplit(base_url)
+        if (parts.scheme != "https" and not
+                (parts.scheme == "http" and parts.hostname in {"127.0.0.1", "localhost"})):
+            raise ZapError("The API must use HTTPS, or HTTP on localhost.")
+        if parts.username or parts.password or parts.query or parts.fragment:
+            raise ZapError("Invalid API URL.")
+        self.base_url = base_url.rstrip("/")
+        self.sign = sign
+
+    def request(self, method, path, data=None):
+        url = self.base_url + "/" + path
+        body = None if data is None else json.dumps(
+            data, ensure_ascii=False, separators=(",", ":")).encode()
+        tags = [["u", url], ["method", method]]
+        if body is not None:
+            tags.append(["payload", hashlib.sha256(body).hexdigest()])
+        event = self.sign(tags)
+        token = base64.b64encode(json.dumps(event, separators=(",", ":")).encode()).decode()
+        request = urllib.request.Request(url, data=body, method=method, headers={
+            "Authorization": "Nostr " + token,
+            "Content-Type": "application/json",
+            "User-Agent": "nostr-stream/1.0",
+        })
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                result = response.read(1024 * 1024)
+                return json.loads(result) if result else {}
+        except urllib.error.HTTPError as error:
+            raise ZapError(f"zap.stream {method} {path} returned HTTP {error.code}.") from None
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            raise ZapError(f"zap.stream {method} {path} failed.") from None
+
+
+def is_publishing(xml, application="local", stream_name="lightning-goats"):
+    root = ET.fromstring(xml)
+    for app in root.findall(".//application"):
+        if app.findtext("name") != application:
+            continue
+        for stream in app.findall("live/stream"):
+            if stream.findtext("name") == stream_name and stream.find("publishing") is not None:
+                return True
+    return False
+
+
+def find_live_event(events, host, service):
+    latest = {}
+    for event in events:
+        if event.get("kind") != 30311:
+            continue
+        tags = event.get("tags", [])
+        values = {tag[0]: tag[1] for tag in tags if len(tag) >= 2}
+        address = (event.get("pubkey"), values.get("d"))
+        if event.get("created_at", 0) >= latest.get(address, {}).get("created_at", -1):
+            latest[address] = event
+    trusted_services = {service.rstrip("/")}
+    if service.rstrip("/") == "https://api-core.zap.stream/api/v1":
+        trusted_services.add("https://api-uk.zap.stream/api/v1")
+    candidates = []
+    for event in latest.values():
+        tags = event.get("tags", [])
+        values = {tag[0]: tag[1] for tag in tags if len(tag) >= 2}
+        owned = any(len(tag) >= 4 and tag[0] == "p" and tag[1] == host
+                    and tag[3].lower() == "host" for tag in tags)
+        if not owned or values.get("status") != "live" or values.get("service", "").rstrip("/") not in trusted_services:
+            continue
+        try:
+            stream_id = str(uuid.UUID(values.get("d", "")))
+        except ValueError:
+            continue
+        playback = next((tag[1] for tag in tags if len(tag) >= 2 and tag[0] == "streaming"
+                         and tag[1].startswith("https://")), "")
+        if not playback.startswith("https://"):
+            continue
+        candidates.append({"stream_id": stream_id, "playback": playback,
+                           "created_at": event.get("created_at", 0)})
+    return max(candidates, key=lambda event: event["created_at"]) if candidates else None
+
+
+class Synchronizer:
+    def __init__(self, api, program, state_file, goals_directory):
+        self.api = api
+        self.program = program
+        self.state_file = state_file
+        self.goals_directory = goals_directory
+        try:
+            self.state = json.loads(state_file.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.state = {}
+
+    def sync(self, youtube_url, event, metadata):
+        parsed = urllib.parse.urlsplit(youtube_url)
+        video_id = urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
+        if parsed.hostname != "www.youtube.com" or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+            raise ZapError("Expected a current YouTube watch URL.")
+        signature = {"stream_id": event["stream_id"], "url": youtube_url,
+                     "metadata": validate_metadata(metadata)}
+        same = all(self.state.get(key) == value for key, value in signature.items())
+        if same and time.time() - self.state.get("updated_at", 0) < 1200:
+            return False
+        if not same or not (self.goals_directory / video_id).is_file():
+            result = subprocess.run([str(self.program), "prepare", youtube_url],
+                                    capture_output=True, timeout=110)
+            if result.returncode:
+                raise ZapError("Preparing the zap goal or announcement failed; will retry.")
+        goal = (self.goals_directory / video_id).read_text().strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", goal):
+            raise ZapError("The prepared zap goal has an invalid event ID.")
+        payload = dict(metadata, id=event["stream_id"], goal=goal)
+        self.api.request("PATCH", "event", payload)
+        pending = list(self.state.get("pending_goals", []))
+        old_url = self.state.get("url")
+        if old_url and old_url != youtube_url and old_url not in pending:
+            pending.append(old_url)
+        new_state = dict(signature, goal=goal, playback=event["playback"],
+                         updated_at=time.time(), pending_goals=pending)
+        self.save_state(new_state)
+        return True
+
+    def save_state(self, new_state):
+        if not new_state:
+            self.state_file.unlink(missing_ok=True)
+            self.state = {}
+            return
+        self.state_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor, name = tempfile.mkstemp(dir=self.state_file.parent)
+        try:
+            with os.fdopen(descriptor, "w") as output:
+                os.fchmod(output.fileno(), 0o600)
+                json.dump(new_state, output)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(name, self.state_file)
+        finally:
+            Path(name).unlink(missing_ok=True)
+        self.state = new_state
+
+    def delete_goal(self, url):
+        if url:
+            video_id = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("v", [""])[0]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+                raise ZapError("Invalid broadcast URL in goal retirement state.")
+            if (self.goals_directory / video_id).is_file():
+                result = subprocess.run([str(self.program), "delete-goal", url],
+                                        capture_output=True, timeout=80)
+                if result.returncode:
+                    raise ZapError("Could not retire the ended stream's goal; will retry.")
+
+    def retire_goal(self):
+        self.delete_goal(self.state.get("url"))
+        pending = self.state.get("pending_goals", [])
+        self.save_state({"pending_goals": pending} if pending else {})
+
+    def retire_pending(self, url):
+        self.delete_goal(url)
+        pending = [entry for entry in self.state.get("pending_goals", []) if entry != url]
+        state = dict(self.state, pending_goals=pending)
+        self.save_state(state if state.get("url") or pending else {})
+
+
+class Watcher:
+    def __init__(self, api, sync, metadata_file, publishing, youtube, events, host, service,
+                 youtube_by_url=None):
+        self.api = api
+        self.sync = sync
+        self.metadata_file = metadata_file
+        self.publishing = publishing
+        self.youtube = youtube
+        self.events = events
+        self.host = host
+        self.service = service
+        self.defaults = None
+        self.offline_checks = 0
+        self.youtube_by_url = youtube_by_url
+        self.pending_checks = {}
+
+    def tick(self):
+        try:
+            return self.tick_checked()
+        except (ZapError, OSError, ValueError, subprocess.SubprocessError):
+            self.offline_checks = 0
+            self.pending_checks.clear()
+            raise
+
+    def poll_pending(self):
+        if self.youtube_by_url is None:
+            return
+        for url in list(self.sync.state.get("pending_goals", [])):
+            try:
+                status, _ = self.youtube_by_url(url)
+                if status in {"OFFLINE", "not_live", "was_live", "post_live", "is_upcoming"}:
+                    self.pending_checks[url] = self.pending_checks.get(url, 0) + 1
+                    if self.pending_checks[url] >= 3:
+                        self.sync.retire_pending(url)
+                        self.pending_checks.pop(url, None)
+                else:
+                    self.pending_checks[url] = 0
+            except (ZapError, OSError, ValueError, subprocess.SubprocessError):
+                self.pending_checks[url] = 0
+
+    def tick_checked(self):
+        metadata = validate_metadata(json.loads(self.metadata_file.read_text()))
+        defaults = dict(metadata, goal="")
+        if self.defaults != defaults:
+            self.api.request("PATCH", "event", defaults)
+            self.defaults = defaults
+        self.poll_pending()
+        if not self.publishing():
+            if self.sync.state.get("url"):
+                status, _ = self.youtube()
+                if status in {"OFFLINE", "not_live", "was_live", "post_live", "is_upcoming"}:
+                    self.offline_checks += 1
+                    if self.offline_checks >= 3:
+                        self.sync.retire_goal()
+                else:
+                    self.offline_checks = 0
+            return "Waiting for OBS to publish to local nginx."
+        self.offline_checks = 0
+        event = find_live_event(self.events(), self.host, self.service)
+        if not event:
+            return "OBS is streaming; waiting for zap.stream's live event."
+        status, url = self.youtube()
+        if status != "is_live":
+            return "OBS is streaming; waiting for YouTube's live broadcast."
+        self.sync.sync(url, event, metadata)
+        return f"zap.stream metadata synchronized: {event['playback']}"
+
+
+def youtube_state(home, url="https://www.youtube.com/@lightning-goats/live"):
+    result = subprocess.run(
+        [str(home / ".local/bin/yt-dlp"), "--no-warnings", "--skip-download",
+         "--ignore-no-formats-error", "--socket-timeout", "8", "--retries", "0",
+         "--print", "%(live_status)s|%(id)s", url],
+        capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        if "not currently live" in result.stderr.lower():
+            return "OFFLINE", ""
+        raise ZapError("YouTube status check failed; keeping current goal state.")
+    lines = result.stdout.strip().splitlines()
+    if not lines or "|" not in lines[-1]:
+        raise ZapError("YouTube returned no usable broadcast metadata.")
+    status, video_id = lines[-1].split("|", 1)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        raise ZapError("YouTube returned an invalid video ID.")
+    return status, "https://www.youtube.com/watch?v=" + video_id
+
+
+def read_events(signer):
+    query = {"kinds": [30311], "#p": [signer.public_key], "since": int(time.time()) - 3600, "limit": 30}
+    result = subprocess.run(
+        [str(signer.nak), "--connect-timeout", "5s", "req", *RELAYS],
+        input=json.dumps(query) + "\n", capture_output=True, text=True, timeout=20)
+    if result.returncode:
+        raise ZapError("Could not read zap.stream's live events from the relays.")
+    events = []
+    for line in result.stdout.splitlines():
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    return events
+
+
+def nginx_publishing(stats_url):
+    if urllib.parse.urlsplit(stats_url).hostname not in {"127.0.0.1", "localhost"}:
+        raise ZapError("nginx stats must be read from localhost.")
+    try:
+        with urllib.request.urlopen(stats_url, timeout=5) as response:
+            return is_publishing(response.read(1024 * 1024))
+    except (urllib.error.URLError, ET.ParseError, TimeoutError):
+        raise ZapError("Cannot read local nginx RTMP stats; keeping current stream state.") from None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--api-url", default=API_URL)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("account", help="Inspect account settings with ingest keys redacted")
+    commands.add_parser("sync-ingest", help="Refresh nginx's zap.stream endpoint and key from the API")
+    metadata = commands.add_parser("metadata", help="Update default or active stream metadata")
+    metadata.add_argument("--file", type=Path, required=True)
+    metadata.add_argument("--stream-id", help="zap.stream UUID for an already-live stream")
+    watch = commands.add_parser("watch", help="Synchronize metadata when OBS publishes to local nginx")
+    watch.add_argument("--file", type=Path, default=Path.home() / ".config/nostr-stream/zap-metadata.json")
+    watch.add_argument("--stats-url", default="http://127.0.0.1:8089/stat")
+    watch.add_argument("--once", action="store_true", help="Run one synchronization check")
+    args = parser.parse_args()
+    payload = None
+    if args.command == "metadata":
+        payload = validate_metadata(json.loads(args.file.read_text()))
+        if args.stream_id:
+            payload["id"] = str(uuid.UUID(args.stream_id))
+    signer = RemoteSigner(Path.home())
+    api = ZapApi(args.api_url, signer.sign)
+    if args.command == "account":
+        print(json.dumps(redact(api.request("GET", "account")), indent=2))
+    elif args.command == "sync-ingest":
+        youtube = json.loads((Path.home() / ".config/nostr-stream/youtube-service.json").read_text())
+        destinations = ingest_destinations(api.request("GET", "account"), youtube)
+        result = subprocess.run(
+            ["sudo", "-n", "/usr/local/libexec/lightning-goats-nginx-routes"],
+            input=json.dumps(destinations), capture_output=True, text=True, timeout=45)
+        if result.returncode:
+            raise ZapError("nginx destination refresh failed; private diagnostics suppressed.")
+        print(result.stdout.strip())
+    elif args.command == "metadata":
+        api.request("PATCH", "event", payload)
+        print("zap.stream metadata updated.")
+    elif args.command == "watch":
+        home = Path.home()
+        sync = Synchronizer(api, home / ".local/bin/nostr-stream",
+                            home / ".local/state/nostr-stream-zap/state.json",
+                            home / ".local/state/lightning-goats-stream/goals")
+        watcher = Watcher(api, sync, args.file, lambda: nginx_publishing(args.stats_url),
+                          lambda: youtube_state(home), lambda: read_events(signer),
+                          signer.public_key, api.base_url,
+                          youtube_by_url=lambda url: youtube_state(home, url))
+        previous = None
+        while True:
+            try:
+                message = watcher.tick()
+            except (ZapError, OSError, ValueError, subprocess.SubprocessError) as error:
+                if args.once:
+                    raise
+                message = str(error) if isinstance(error, ZapError) else type(error).__name__
+            if message != previous:
+                print(message, flush=True)
+                previous = message
+            if args.once:
+                return
+            time.sleep(10)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ZapError, OSError, ValueError, subprocess.SubprocessError) as error:
+        message = str(error) if isinstance(error, (ZapError, ValueError)) else type(error).__name__
+        print(f"nostr-stream zap: {message}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(0)

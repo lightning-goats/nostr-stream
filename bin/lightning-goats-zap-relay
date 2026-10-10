@@ -1,0 +1,128 @@
+#!/usr/bin/python3
+"""Remux the local nginx feed for zap.stream without re-encoding."""
+import ctypes
+import os
+import subprocess
+from pathlib import Path
+import re
+import sys
+
+
+def destination(routes):
+    candidates = [line.removeprefix('# zap-relay ') for line in routes.splitlines()
+                  if line.startswith('# zap-relay ')]
+    if len(candidates) != 1 or not re.fullmatch(
+            r'rtmp://[A-Za-z0-9.-]+\.zap\.stream(?::1935)?/[A-Za-z0-9/_-]+/[A-Za-z0-9_-]{16,256}',
+            candidates[0]):
+        raise ValueError('Invalid private zap.stream relay destination.')
+    return candidates[0]
+
+
+def ffmpeg_arguments():
+    return ['/usr/bin/ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'quiet',
+            '-i', 'rtmp://127.0.0.1:1935/local/lightning-goats',
+            '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy',
+            '-flvflags', 'no_duration_filesize', '-f', 'flv', 'pipe:1']
+
+
+def read_exact(stream, size, eof_ok=False):
+    data = bytearray()
+    while len(data) < size:
+        piece = stream.read(size - len(data))
+        if not piece:
+            if eof_ok and not data:
+                return b''
+            raise ValueError('Truncated remux packet.')
+        data.extend(piece)
+    return bytes(data)
+
+
+def flv_packets(stream):
+    prefix = read_exact(stream, 13)
+    if prefix[:3] != b'FLV' or int.from_bytes(prefix[5:9], 'big') != 9:
+        raise ValueError('Invalid remux header.')
+    while header := read_exact(stream, 11, eof_ok=True):
+        size = int.from_bytes(header[1:4], 'big')
+        if size > 16 * 1024 * 1024:
+            raise ValueError('Remux packet exceeds limit.')
+        body = read_exact(stream, size + 4)
+        if int.from_bytes(body[-4:], 'big') != size + 11:
+            raise ValueError('Invalid remux packet size.')
+        yield prefix + header + body
+        prefix = b''
+
+
+class Publisher:
+    """Keep the private RTMP destination in memory, never in process arguments."""
+    def __init__(self, url):
+        lib = self.lib = ctypes.CDLL('librtmp.so.1')
+        pointer = ctypes.c_void_p
+        declarations = {
+            'RTMP_Alloc': ([], pointer), 'RTMP_Init': ([pointer], None),
+            'RTMP_SetupURL': ([pointer, ctypes.c_char_p], ctypes.c_int),
+            'RTMP_EnableWrite': ([pointer], None),
+            'RTMP_Connect': ([pointer, pointer], ctypes.c_int),
+            'RTMP_ConnectStream': ([pointer, ctypes.c_int], ctypes.c_int),
+            'RTMP_Write': ([pointer, ctypes.c_char_p, ctypes.c_int], ctypes.c_int),
+            'RTMP_Close': ([pointer], None), 'RTMP_Free': ([pointer], None),
+            'RTMP_LogSetLevel': ([ctypes.c_int], None),
+        }
+        for name, (arguments, result) in declarations.items():
+            function = getattr(lib, name)
+            function.argtypes, function.restype = arguments, result
+        lib.RTMP_LogSetLevel(0)
+        self.handle = lib.RTMP_Alloc()
+        if not self.handle:
+            raise OSError('Could not allocate relay connection.')
+        lib.RTMP_Init(self.handle)
+        self.url_buffer = ctypes.create_string_buffer(url.encode())
+        try:
+            if not lib.RTMP_SetupURL(self.handle, self.url_buffer):
+                raise OSError('Could not configure relay connection.')
+            lib.RTMP_EnableWrite(self.handle)
+            if not lib.RTMP_Connect(self.handle, None) or not lib.RTMP_ConnectStream(self.handle, 0):
+                raise OSError('Could not connect relay.')
+        except Exception:
+            self.close()
+            raise
+
+    def write(self, packet):
+        if self.lib.RTMP_Write(self.handle, packet, len(packet)) != len(packet):
+            raise OSError('Relay connection failed.')
+
+    def close(self):
+        if self.handle:
+            self.lib.RTMP_Close(self.handle)
+            self.lib.RTMP_Free(self.handle)
+            self.handle = None
+
+
+def main():
+    credentials = Path(os.environ['CREDENTIALS_DIRECTORY'])
+    url = destination((credentials / 'routes').read_text())
+    process = subprocess.Popen(ffmpeg_arguments(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    publisher = None
+    try:
+        packets = flv_packets(process.stdout)
+        first = next(packets)
+        publisher = Publisher(url)
+        publisher.write(first)
+        for packet in packets:
+            publisher.write(packet)
+    finally:
+        if publisher:
+            publisher.close()
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, KeyError, StopIteration):
+        print('zap.stream relay could not load its private configuration.', file=sys.stderr)
+        sys.exit(1)

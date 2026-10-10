@@ -1,5 +1,86 @@
 # Lightning Goats Nostr Stream
 
+## OBS with local nginx and zap.stream
+
+The `--zap` installation mode uses this route:
+
+```text
+OBS -> nginx on localhost:1935/local/lightning-goats
+       |-> YouTube
+       |-> FFmpeg (copy) -> zap.stream -> public HLS playback and the NIP-53 live event
+```
+
+`nostr-stream zap` authenticates API requests through the local NIP-46 bunker.
+The identity nsec stays in the bunker. The client credential must match
+`~/.config/nak/authorized-client.pub`.
+
+```bash
+./install.sh --zap
+sudo install -m 755 bin/lightning-goats-nginx-routes bin/lightning-goats-zap-relay /usr/local/libexec/
+sudo install -m 644 systemd/lightning-goats-zap-relay.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now lightning-goats-zap-relay.service
+nostr-stream zap account
+nostr-stream zap metadata --file ~/.config/nostr-stream/zap-metadata.json
+nostr-stream zap metadata --file metadata.json --stream-id ZAP_STREAM_UUID
+nostr-stream zap sync-ingest
+lightning-goats-obs --check
+```
+
+The account command redacts ingest keys. `sync-ingest` fetches the current Basic
+endpoint and key from zap.stream and passes them on stdin to the root-owned
+`/usr/local/libexec/lightning-goats-nginx-routes` updater. It preserves the YouTube
+key from `~/.config/nostr-stream/youtube-service.json` (mode 600). Update that file
+when rotating the YouTube key, or set a new YouTube destination in OBS before
+closing it; the launcher captures that key before restoring the nginx route.
+The zap.stream API does not provide YouTube credentials.
+
+The updater accepts only YouTube's ingest host and `*.zap.stream`, writes
+`/etc/nginx/stream-destinations.conf` with mode 600, validates nginx, and reloads
+it when a destination changes, then refreshes the remux relay credential. A lock
+serializes concurrent updates. Failed
+validation restores the previous file.
+Include that file inside nginx's `application local` block. Keep the RTMP
+listener on `127.0.0.1:1935`, and expose `rtmp_stat all` only at
+`http://127.0.0.1:8089/stat`. Use `worker_processes 1` so every statistics
+request sees the local publisher. The destinations file contains the YouTube
+`push` and a private `# zap-relay` destination consumed by the system relay
+service through `LoadCredential`. The relay copies video and audio without
+re-encoding; it reconnects after failures and waits for OBS through nginx.
+FFmpeg and the system `librtmp.so.1` library are required. FFmpeg writes to
+a pipe, and the relay publishes through librtmp with the private destination
+kept in memory; ingest keys stay out of process arguments. This avoids an observed compatibility failure where
+nginx's direct push received `NetStream.Publish.Start` but zap.stream never
+produced playable video.
+
+Enable `nak-bunker.service` and `nostr-stream-zap.service`. Leave
+`youtube-nostr-watch.service` disabled in this mode to avoid another live event.
+The zap watcher observes nginx's actual publisher, waits for the current YouTube
+broadcast and zap.stream event, creates/reuses one goal and announcement, then
+updates that existing event's metadata and goal. It refreshes metadata every 20
+minutes and retires the goal after three consecutive confirmed YouTube offline
+checks. Older broadcasts remain tracked across restarts until their individual
+YouTube URLs are confirmed ended; transient failures reset confirmation counts.
+zap.stream owns live/ended status and the playback URL. The watcher accepts
+its UK regional service address and chooses HTTPS playback when events also
+advertise another transport.
+
+The zap installer wires desktop and login launchers to `lightning-goats-obs`. It refreshes ingest
+destinations, initializes metadata, restores OBS's local nginx destination, and
+launches OBS with streaming enabled. Existing OBS service settings are backed
+up privately before replacement. Close and reopen an already-running OBS
+instance to load the new service settings. The launcher selects the uniquely
+named `Lightning Goats` scene collection and the `Untitled` profile. Preserve
+the camera and overlay in that collection. To open a stopped preview during
+repairs, create `~/.config/nostr-stream/hold-stream`; remove it after verifying
+the picture to restore automatic streaming on startup.
+
+Run regression tests with `python3 -m unittest discover -s tests -v`. The tests
+use generated, disposable identities and local HTTP fixtures; they do not
+publish public events or use deployment credentials.
+
+## Original YouTube watcher with self-hosted HLS
+
 Self-hosted Nostr live-stream publishing for the Lightning Goats YouTube channel and Lightning Goats HLS endpoint.
 
 This project watches the Lightning Goats YouTube channel, detects when a broadcast goes live, publishes a NIP-53 `kind:30311` live-stream event, keeps that event fresh while the broadcast is active, and updates it to `status=ended` when YouTube ends.

@@ -1,0 +1,22 @@
+[Unit]
+Description=Lightning Goats OBS to zap.stream metadata integration
+Wants=network-online.target
+After=network-online.target nak-bunker.service
+Requires=nak-bunker.service
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+LoadCredentialEncrypted=nostr-client:%h/.config/nak/credentials/nostr-client.cred
+ExecStart=%h/.local/bin/nostr-stream zap watch
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/lightning-goats-stream %h/.local/state/nostr-stream-zap
+
+[Install]
+WantedBy=default.target

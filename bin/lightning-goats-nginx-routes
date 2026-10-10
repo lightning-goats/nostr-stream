@@ -1,0 +1,120 @@
+#!/usr/bin/python3
+"""Update only the two managed nginx RTMP destinations; reads JSON on stdin."""
+
+import json
+import fcntl
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+
+
+def render_routes(destinations):
+    if not isinstance(destinations, dict) or set(destinations) != {"youtube", "zap"}:
+        raise ValueError("Expected exactly the YouTube and zap.stream destinations.")
+    lines = ["# Managed by nostr-stream. Contains private ingest keys; keep mode 600."]
+    for name in ("youtube", "zap"):
+        entry = destinations[name]
+        if not isinstance(entry, dict) or set(entry) != {"server", "key"}:
+            raise ValueError("Invalid destination fields.")
+        server, key = entry["server"], entry["key"]
+        if not isinstance(server, str) or not isinstance(key, str):
+            raise ValueError("Destination fields must be strings.")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", key):
+            raise ValueError("Invalid ingest key format.")
+        if name == "youtube":
+            if server != "rtmp://a.rtmp.youtube.com/live2":
+                raise ValueError("Unapproved YouTube ingest endpoint.")
+        else:
+            if not re.fullmatch(r"rtmp://[A-Za-z0-9.-]+(?::1935)?/[A-Za-z0-9/_-]+", server):
+                raise ValueError("Invalid zap.stream ingest endpoint.")
+            parts = urllib.parse.urlsplit(server)
+            if not parts.hostname or not parts.hostname.endswith(".zap.stream"):
+                raise ValueError("Unapproved zap.stream ingest host.")
+        url = f"{server.rstrip('/')}/{key}"
+        lines.append(f"push {url};" if name == "youtube" else f"# zap-relay {url}")
+    return "\n".join(lines) + "\n"
+
+
+def atomic_write(path, data):
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def update_routes(destinations, target, validate, reload):
+    lock_path = target.with_suffix(".lock")
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "rb") as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        return update_locked(destinations, target, validate, reload)
+
+
+def update_locked(destinations, target, validate, reload):
+    data = render_routes(destinations).encode()
+    previous = target.read_bytes() if target.exists() else None
+    if previous == data:
+        return False
+    if previous is not None:
+        atomic_write(target.with_suffix(".previous"), previous)
+    atomic_write(target, data)
+    reloading = False
+    try:
+        validate()
+        reloading = True
+        reload()
+    except Exception:
+        if previous is None:
+            target.unlink(missing_ok=True)
+        else:
+            atomic_write(target, previous)
+        if reloading:
+            validate()
+            reload()
+        raise
+    return True
+
+
+def command(arguments, label):
+    result = subprocess.run(arguments, capture_output=True, timeout=20)
+    if result.returncode:
+        raise RuntimeError(label + " failed; prior destinations restored.")
+
+
+def reload_services():
+    command(["/usr/bin/systemctl", "reload", "nginx"], "nginx reload")
+    command(["/usr/bin/systemctl", "restart", "lightning-goats-zap-relay.service"],
+            "zap.stream relay refresh")
+
+
+def main():
+    if os.geteuid() != 0:
+        raise RuntimeError("Run this updater using sudo.")
+    data = sys.stdin.buffer.read(16385)
+    if len(data) > 16384:
+        raise ValueError("Destination input is too large.")
+    changed = update_routes(
+        json.loads(data), Path("/etc/nginx/stream-destinations.conf"),
+        lambda: command(["/usr/sbin/nginx", "-t"], "nginx validation"),
+        reload_services)
+    print("nginx destinations refreshed." if changed else "nginx destinations already current.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        message = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+        print(f"lightning-goats-nginx-routes: {message}", file=sys.stderr)
+        sys.exit(1)
