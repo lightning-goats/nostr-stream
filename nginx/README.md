@@ -4,14 +4,19 @@ The Fedora 44 deployment uses the distribution nginx 1.30.5 package and a
 dynamic `ngx_rtmp_module` built against that exact nginx source version. The
 build pins arut/nginx-rtmp-module at
 `6c7719d0ba32e00b563ec70bd43dad11960fa9c4` and applies
-`rtmp-publish-metadata.patch`. The `meta publish` mode emits the
+`rtmp-publish-metadata.patch` and `rtmp-relay-reconnect.patch`. The
+`meta publish` mode emits the
 `@setDataFrame` envelope required by zap.stream while leaving `meta on`,
 `meta copy`, and `meta off` unchanged.
 
 `./build-fedora-module.sh` downloads the matching nginx source, builds the
 module, generates a disposable H.264/AAC fixture, and runs
-`check_metadata.py` on loopback ports 19451–19453. The check stops if any test
-port is occupied. Only after this passes does it install the module; an
+`check_metadata.py` on loopback ports 19451–19453 and
+`check_relay_failure.py` on port 19454. The checks stop if their test ports
+are occupied. The second test forces a native push to refuse connections and
+checks that nginx keeps the ingest worker alive. `--check-only` validates a
+candidate without replacing the installed module. The normal build installs
+only after both checks pass; an
 existing module is copied beside it with a timestamped backup. Fedora build
 prerequisites are `gcc`, `make`, `git`, `patch`, `pcre2-devel`,
 `openssl-devel`, and `zlib-devel`. Rebuild after every nginx package upgrade.

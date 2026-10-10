@@ -1,0 +1,11 @@
+diff --git a/ngx_rtmp_relay_module.c b/ngx_rtmp_relay_module.c
+--- a/ngx_rtmp_relay_module.c
++++ b/ngx_rtmp_relay_module.c
+@@ -697,3 +697,6 @@ ngx_rtmp_relay_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
+-        if (!ctx->push_evt.timer_set) {
++        /* A failed initial push creates the session context after ctx was
++         * read above. Refresh it before scheduling retry to avoid NULL access. */
++        ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_relay_module);
++        if (ctx && !ctx->push_evt.timer_set) {
+             ngx_add_timer(&ctx->push_evt, racf->push_reconnect);
+         }

@@ -3,6 +3,13 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+CHECK_ONLY=false
+if [[ "${1:-}" == --check-only ]]; then
+    CHECK_ONLY=true
+elif [[ $# -gt 0 ]]; then
+    echo "usage: build-fedora-module.sh [--check-only]" >&2
+    exit 2
+fi
 MODULE_REPO=https://github.com/arut/nginx-rtmp-module.git
 MODULE_COMMIT=6c7719d0ba32e00b563ec70bd43dad11960fa9c4
 NGINX_VERSION="$(nginx -v 2>&1 | sed -E 's#^.*/([0-9]+\.[0-9]+\.[0-9]+)$#\1#')"
@@ -22,6 +29,7 @@ tar -xzf "$BUILD_DIR/nginx.tar.gz" -C "$BUILD_DIR"
 git clone --quiet "$MODULE_REPO" "$BUILD_DIR/ngx_rtmp"
 git -C "$BUILD_DIR/ngx_rtmp" checkout --quiet "$MODULE_COMMIT"
 patch --directory="$BUILD_DIR/ngx_rtmp" -p1 < "$ROOT/nginx/rtmp-publish-metadata.patch"
+patch --directory="$BUILD_DIR/ngx_rtmp" -p1 < "$ROOT/nginx/rtmp-relay-reconnect.patch"
 cd "$BUILD_DIR/nginx-${NGINX_VERSION}"
 ./configure --with-compat --with-debug --with-threads \
     --with-http_ssl_module --with-http_v2_module --with-http_v3_module \
@@ -35,6 +43,13 @@ ffmpeg -hide_banner -loglevel error -y \
     -f flv "$BUILD_DIR/fixture.flv"
 python3 "$ROOT/nginx/check_metadata.py" \
     --module "$PWD/objs/ngx_rtmp_module.so" --fixture "$BUILD_DIR/fixture.flv"
+python3 "$ROOT/nginx/check_relay_failure.py" \
+    --module "$PWD/objs/ngx_rtmp_module.so" --fixture "$BUILD_DIR/fixture.flv"
+
+if "$CHECK_ONLY"; then
+    echo "Validated candidate module: $PWD/objs/ngx_rtmp_module.so"
+    exit 0
+fi
 
 target=/usr/lib64/nginx/modules/ngx_rtmp_module.so
 sudo install -d -o root -g root -m 0755 "$(dirname "$target")"
