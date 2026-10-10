@@ -48,7 +48,9 @@ request sees the local publisher. The destinations file contains the YouTube
 service through `LoadCredential`. The relay uses NVENC to encode zap.stream video at 720p30 and 2.5 Mbps,
 with two-second keyframes, and copies audio. YouTube retains OBS's original
 1080p feed. This leaves headroom on the measured upload path to the UK server.
-The relay reconnects after failures and waits for OBS through nginx.
+The relay limits decoder and filter threads and runs at lower CPU priority
+to protect OBS rendering. It reconnects after failures and waits for OBS
+through nginx.
 FFmpeg with working `h264_nvenc` support and the system `librtmp.so.1`
 library are required. FFmpeg writes to
 a pipe, and the relay publishes through librtmp with the private destination
