@@ -53,6 +53,24 @@ The host uses the existing Balanced power profile (`powerprofilesctl set balance
 to reduce CPU heat while keeping NVIDIA rendering and encoding active. In
 Performance mode, the CPU repeatedly exceeded 90°C with intermittent missed frames.
 
+The host uses the kernel's installed BBR TCP congestion control. With CUBIC,
+the UK zap ingest connection accumulated about 750 KB of unsent data and nginx
+dropped frames. A two-minute BBR check held 30 fps with no relay or OBS drops;
+public zap video had regular 33 ms frame timestamps. Install the existing
+sysctl configuration to preserve this across boots:
+
+```sh
+sudo install -m 644 config/90-lightning-goats-stream.conf /etc/sysctl.d/
+sudo sysctl -p /etc/sysctl.d/90-lightning-goats-stream.conf
+```
+
+It applies to new TCP connections on this host. Existing nginx connections
+need one brief reconnect when switching algorithms. The kernel autoloads the
+installed `tcp_bbr` module. Retain the existing `fq_codel` queue discipline.
+To revert, remove this file and run
+`sudo sysctl -w net.ipv4.tcp_congestion_control=cubic`; reconnect nginx only
+when needed to change its established sockets.
+
 The installed nginx RTMP module needs the small compatibility patch in
 `nginx/rtmp-publish-metadata.patch`. Standard `meta on` and `meta copy` strip
 `@setDataFrame`, but zap.stream's RTMP receiver requires that envelope before
