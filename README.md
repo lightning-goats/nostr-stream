@@ -44,9 +44,14 @@ listener on loopback and use one worker, `chunk_size 4096`, `push_reconnect 1s`,
 RTMP access logging with `access_log off` in the `rtmp` block.
 OBS provides the only video encoding, using NVIDIA NVENC. Nginx forwards the
 same encoded video and audio directly to both endpoints without transcoding,
-remux processes, or custom publishers. OBS graphics device selection must be
-verified in its startup log; PRIME environment variables alone do not guarantee
-NVIDIA rendering in the Snap/Wayland installation.
+remux processes, or custom publishers. The launcher uses NVIDIA PRIME with
+XWayland (`XDG_SESSION_TYPE=x11`, `QT_QPA_PLATFORM=xcb`) so this OBS Snap
+selects the NVIDIA GPU for scene rendering as well as NVENC encoding. The
+interface stays on the laptop display. Native Wayland selected Intel on this
+host despite PRIME variables; verify the selected adapter in the startup log.
+The host uses the existing Balanced power profile (`powerprofilesctl set balanced`)
+to reduce CPU heat while keeping NVIDIA rendering and encoding active. In
+Performance mode, the CPU repeatedly exceeded 90°C with intermittent missed frames.
 
 The installed nginx RTMP module needs the small compatibility patch in
 `nginx/rtmp-publish-metadata.patch`. Standard `meta on` and `meta copy` strip

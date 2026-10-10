@@ -61,12 +61,14 @@ class LauncherTests(unittest.TestCase):
 
     def test_nvidia_offload_request_preserves_the_laptop_desktop_environment(self):
         launcher = self.module()
-        desktop = {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}
+        desktop = {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0", "XDG_SESSION_TYPE": "wayland"}
         result = launcher.obs_environment(desktop)
         self.assertEqual(result["__NV_PRIME_RENDER_OFFLOAD"], "1")
         self.assertEqual(result["__GLX_VENDOR_LIBRARY_NAME"], "nvidia")
+        self.assertEqual(result["XDG_SESSION_TYPE"], "x11")
+        self.assertEqual(result["QT_QPA_PLATFORM"], "xcb")
         self.assertEqual(result["WAYLAND_DISPLAY"], desktop["WAYLAND_DISPLAY"])
-        self.assertEqual(desktop, {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"})
+        self.assertEqual(desktop, {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0", "XDG_SESSION_TYPE": "wayland"})
 
     def test_preview_hold_uses_the_unique_collection_without_auto_streaming(self):
         launcher = self.module()
