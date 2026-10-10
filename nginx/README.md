@@ -31,11 +31,34 @@ Destination credentials live in root-owned mode-600
 uses atomic replacement, runs `nginx -t`, reloads nginx, and restores the old
 file if validation or reload fails.
 
-SELinux must allow nginx to bind TCP 1935 and 8089. The installer records the
-previous SELinux port configuration before assigning `http_port_t`; it does
-not change global TCP congestion control. The service waits for
-`network-online.target`. The stock nginx config is backed up before the
-managed config replaces it. The distro had no RTMP module at migration time.
+SELinux must allow nginx to bind the loopback listeners on TCP 1935 and 8089.
+Outbound RTMP also needs a `name_connect` rule for TCP 1935. Fedora's stock
+policy labels port 1935 for unrelated services and leaves
+`httpd_can_network_connect` disabled. Do not enable that broad boolean for this
+deployment. Compile `lightning_goats_rtmp.te`, install the resulting policy
+module, and label TCP 1935 as `lightning_goats_rtmp_port_t`; this allows nginx's
+`httpd_t` domain to connect only to that destination port. DNS already works
+through the host resolver. The policy source is tested with `checkmodule` and
+`semodule_package` by `tests/test_nginx_selinux_policy.py`.
+
+For a manual install, first record local overrides with
+`sudo semanage port -l -C`, then run:
+
+```sh
+checkmodule -M -m -o /tmp/lightning_goats_rtmp.mod nginx/lightning_goats_rtmp.te
+semodule_package -o /tmp/lightning_goats_rtmp.pp -m /tmp/lightning_goats_rtmp.mod
+sudo semodule -i /tmp/lightning_goats_rtmp.pp
+sudo semanage port -m -t lightning_goats_rtmp_port_t -p tcp 1935
+```
+
+To roll back, remove the local TCP 1935 port override with
+`sudo semanage port -d -p tcp 1935` (then restore any recorded local override)
+and remove the policy module with
+`sudo semodule -r lightning_goats_rtmp`. This restores Fedora's policy port
+labels. The service waits for `network-online.target`. The stock nginx config
+is backed up before the managed config replaces it. The distro had no RTMP
+module at migration time. This setup does not change global TCP congestion
+control.
 
 ## Local metadata validation
 

@@ -1,0 +1,10 @@
+module lightning_goats_rtmp 1.0;
+
+require {
+    type httpd_t;
+    attribute port_type;
+    class tcp_socket name_connect;
+}
+
+type lightning_goats_rtmp_port_t, port_type;
+allow httpd_t lightning_goats_rtmp_port_t:tcp_socket name_connect;
