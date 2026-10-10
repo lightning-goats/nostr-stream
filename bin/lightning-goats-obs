@@ -248,7 +248,8 @@ def write_desktop_integration(home, launcher, source=None):
     state_dir = home / ".local/state/nostr-stream-zap/desktop-backups"
     applications = home / ".local/share/applications"
     target = applications / "com.obsproject.Studio.desktop"
-    updated = _launcher_desktop_text(content, launcher)
+    preview_launcher = f"{launcher} --preview"
+    updated = _launcher_desktop_text(content, preview_launcher)
     if not target.is_file() or target.read_text(encoding="utf-8") != updated:
         _backup_once(target, state_dir)
         _atomic_text(target, updated, 0o644)
@@ -259,7 +260,7 @@ def write_desktop_integration(home, launcher, source=None):
             existing = path.read_text(encoding="utf-8", errors="replace")
             if not re.search(r"(?im)^Exec=.*(?:com\.obsproject\.Studio|\bobs(?:-studio)?\b)", existing):
                 continue
-            replacement = _launcher_desktop_text(existing, launcher)
+            replacement = _launcher_desktop_text(existing, preview_launcher)
             if replacement != existing:
                 _backup_once(path, state_dir)
                 _atomic_text(path, replacement, 0o644)
@@ -284,6 +285,8 @@ def wait_for_nginx_listener(timeout=20):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="Verify readiness without launching OBS")
+    parser.add_argument("--preview", action="store_true",
+                        help="Open OBS without changing destinations or starting a stream")
     parser.add_argument("--install-desktop", action="store_true",
                         help="Install one OBS desktop override and retarget existing OBS autostart")
     args = parser.parse_args()
@@ -295,24 +298,25 @@ def main():
     profile_name, collection_name = discover_obs_configuration(config_dir)
     profile = config_dir / "basic/profiles" / profile_name / "service.json"
     youtube_profile = home / ".config/nostr-stream/youtube-service.json"
-    hold = (home / ".config/nostr-stream/hold-stream").exists()
+    hold = args.preview or (home / ".config/nostr-stream/hold-stream").exists()
 
-    wait_for_nginx_listener()
-    capture_youtube_profile(profile, youtube_profile)
-    if not youtube_profile.is_file():
-        raise RuntimeError("No saved YouTube ingest key is available; configure it in OBS once before migration.")
+    if not args.preview:
+        wait_for_nginx_listener()
+        capture_youtube_profile(profile, youtube_profile)
+        if not youtube_profile.is_file():
+            raise RuntimeError("No saved YouTube ingest key is available; configure it in OBS once before migration.")
 
-    result = subprocess.run([str(home / ".local/bin/nostr-stream"), "zap", "sync-ingest"],
-                            capture_output=True, timeout=100)
-    if result.returncode:
-        raise RuntimeError("Refreshing nginx's ingest destinations failed; OBS was not launched.")
-    result = subprocess.run(
-        [str(home / ".local/bin/nostr-stream"), "zap", "metadata", "--file",
-         str(home / ".config/nostr-stream/zap-metadata.json")], capture_output=True, timeout=90)
-    if result.returncode:
-        raise RuntimeError("zap.stream metadata initialization failed; OBS was not launched.")
+        result = subprocess.run([str(home / ".local/bin/nostr-stream"), "zap", "sync-ingest"],
+                                capture_output=True, timeout=100)
+        if result.returncode:
+            raise RuntimeError("Refreshing nginx's ingest destinations failed; OBS was not launched.")
+        result = subprocess.run(
+            [str(home / ".local/bin/nostr-stream"), "zap", "metadata", "--file",
+             str(home / ".config/nostr-stream/zap-metadata.json")], capture_output=True, timeout=90)
+        if result.returncode:
+            raise RuntimeError("zap.stream metadata initialization failed; OBS was not launched.")
 
-    configure_profile(profile, home / ".local/state/obs-config-backups/launcher")
+        configure_profile(profile, home / ".local/state/obs-config-backups/launcher")
     if args.check:
         print("nginx routing and zap.stream metadata are ready; OBS was not launched.")
         return

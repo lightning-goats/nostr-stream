@@ -96,8 +96,10 @@ zap.stream owns live/ended status and the playback URL. The watcher accepts
 its UK regional service address and chooses HTTPS playback when events also
 advertise another transport.
 
-The zap installer wires desktop launchers to `lightning-goats-obs` and only
-retargets an autostart entry if one already exists. It refreshes ingest
+The zap installer wires desktop launchers to `lightning-goats-obs --preview`
+so the OBS icon always opens a non-streaming preview. It only retargets an
+autostart entry if one already exists. Invoke `lightning-goats-obs` directly
+for the explicit cutover launch; it refreshes ingest
 destinations, initializes metadata, restores OBS's local nginx destination, and
 launches OBS with streaming enabled. Existing OBS service settings are backed
 up privately before replacement. Close and reopen an already-running OBS

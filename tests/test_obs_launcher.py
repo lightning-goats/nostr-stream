@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "lightning-goats-obs"
@@ -145,7 +146,7 @@ class LauncherTests(unittest.TestCase):
             target.parent.mkdir(parents=True)
             target.write_text("[Desktop Entry]\nName=Old custom OBS\nExec=obs\n")
             launcher.write_desktop_integration(home, binary, source)
-            self.assertIn(f"Exec={binary}", target.read_text())
+            self.assertIn(f"Exec={binary} --preview", target.read_text())
             self.assertFalse((home / ".config/autostart").exists())
             backups = list((home / ".local/state/nostr-stream-zap/desktop-backups").glob("*"))
             launcher.write_desktop_integration(home, binary, source)
@@ -165,7 +166,7 @@ class LauncherTests(unittest.TestCase):
             auto.write_text("[Desktop Entry]\nName=OBS\nExec=flatpak run com.obsproject.Studio\n")
             binary = home / ".local/bin/lightning-goats-obs"
             launcher.write_desktop_integration(home, binary, source)
-            self.assertIn(f"Exec={binary}", auto.read_text())
+            self.assertIn(f"Exec={binary} --preview", auto.read_text())
             self.assertEqual(len(list(auto.parent.glob("*.desktop"))), 1)
 
     def test_changing_service_destination_preserves_scene_collection_bytes(self):
@@ -195,6 +196,31 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn("--startstreaming", held)
         self.assertEqual(held[held.index("--collection") + 1], "Collection B")
         self.assertIn("--startstreaming", launcher.obs_arguments(False, "Profile A", "Collection B", "flatpak"))
+
+    def test_preview_cli_opens_obs_without_nginx_or_credential_checks(self):
+        launcher = self.module()
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = home / ".var/app/com.obsproject.Studio/config/obs-studio"
+            profile = config / "basic/profiles/Day"
+            profile.mkdir(parents=True)
+            (profile / "basic.ini").write_text("[General]\nName=Day\n")
+            scenes = config / "basic/scenes"
+            scenes.mkdir(parents=True)
+            (scenes / "Goats.json").write_text('{"name":"Goats"}')
+            with patch.object(launcher.Path, "home", return_value=home), \
+                    patch.object(launcher.sys, "argv", ["lightning-goats-obs", "--preview"]), \
+                    patch.object(launcher, "detect_obs_platform",
+                                 return_value=("flatpak", config, "flatpak")), \
+                    patch.object(launcher, "wait_for_nginx_listener") as listener, \
+                    patch.object(launcher, "configure_profile") as configure, \
+                    patch.object(launcher.subprocess, "run") as run, \
+                    patch.object(launcher.os, "execvpe") as execute:
+                launcher.main()
+            listener.assert_not_called()
+            configure.assert_not_called()
+            run.assert_not_called()
+            self.assertNotIn("--startstreaming", execute.call_args.args[1])
 
 
 if __name__ == "__main__":
