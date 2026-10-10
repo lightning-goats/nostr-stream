@@ -33,8 +33,9 @@ class RoutesTests(unittest.TestCase):
                                            lambda: changes.append("reload"))
             self.assertTrue(changed)
             self.assertEqual(changes, ["validate", "reload"])
-            self.assertIn("# zap-relay rtmp://in.uk.zap.stream:1935/basic/zap-test-key-123456", target.read_text())
-            self.assertNotIn("\npush rtmp://in.uk.zap.stream", target.read_text())
+            self.assertIn("push rtmp://in.uk.zap.stream:1935/basic/zap-test-key-123456;", target.read_text())
+            self.assertIn("push rtmp://a.rtmp.youtube.com/live2/youtube-test-key-123;", target.read_text())
+            self.assertEqual(target.read_text().count("\npush "), 2)
             self.assertEqual(target.stat().st_mode & 0o777, 0o600)
             self.assertFalse(routes.update_routes(self.destinations(), target,
                                                  lambda: changes.append("validate"),
@@ -54,7 +55,7 @@ class RoutesTests(unittest.TestCase):
                 routes.update_routes(self.destinations(), target, fail, lambda: self.fail("must not reload"))
             self.assertEqual(target.read_text(), "old destinations")
 
-    def test_partial_service_failure_reloads_restored_destinations(self):
+    def test_failed_reload_reapplies_restored_destinations(self):
         routes = self.module()
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "destinations.conf"
@@ -63,7 +64,7 @@ class RoutesTests(unittest.TestCase):
             def reload():
                 runtime.append(target.read_text())
                 if len(runtime) == 1:
-                    raise RuntimeError("relay restart failed after nginx reload")
+                    raise RuntimeError("nginx reload failed")
             with self.assertRaises(RuntimeError):
                 routes.update_routes(self.destinations(), target, lambda: None, reload)
             self.assertEqual(runtime[-1], "old destinations")

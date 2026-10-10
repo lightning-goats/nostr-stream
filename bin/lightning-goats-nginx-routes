@@ -35,7 +35,7 @@ def render_routes(destinations):
             if not parts.hostname or not parts.hostname.endswith(".zap.stream"):
                 raise ValueError("Unapproved zap.stream ingest host.")
         url = f"{server.rstrip('/')}/{key}"
-        lines.append(f"push {url};" if name == "youtube" else f"# zap-relay {url}")
+        lines.append(f"push {url};")
     return "\n".join(lines) + "\n"
 
 
@@ -94,8 +94,6 @@ def command(arguments, label):
 
 def reload_services():
     command(["/usr/bin/systemctl", "reload", "nginx"], "nginx reload")
-    command(["/usr/bin/systemctl", "restart", "lightning-goats-zap-relay.service"],
-            "zap.stream relay refresh")
 
 
 def main():

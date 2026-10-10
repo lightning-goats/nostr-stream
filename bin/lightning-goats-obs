@@ -58,6 +58,13 @@ def configure_profile(profile, backups):
         Path(name).unlink(missing_ok=True)
 
 
+def obs_environment(desktop):
+    environment = dict(desktop)
+    environment["__NV_PRIME_RENDER_OFFLOAD"] = "1"
+    environment["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
+    return environment
+
+
 def obs_arguments(hold):
     arguments = ["/snap/bin/obs-studio", "--profile", "Untitled",
                  "--collection", "Lightning Goats"]
@@ -77,7 +84,7 @@ def main():
         if args.check:
             print("Streaming is held for preview verification.")
             return
-        os.execv("/snap/bin/obs-studio", obs_arguments(True))
+        os.execve("/snap/bin/obs-studio", obs_arguments(True), obs_environment(os.environ))
     capture_youtube_profile(profile, home / ".config/nostr-stream/youtube-service.json")
     deadline = time.monotonic() + 20
     while True:
@@ -103,7 +110,7 @@ def main():
     if args.check:
         print("nginx routing and zap.stream metadata are ready; OBS was not launched.")
         return
-    os.execv("/snap/bin/obs-studio", obs_arguments(False))
+    os.execve("/snap/bin/obs-studio", obs_arguments(False), obs_environment(os.environ))
 
 
 if __name__ == "__main__":

@@ -59,6 +59,15 @@ class LauncherTests(unittest.TestCase):
             launcher.capture_youtube_profile(profile, keeper)
             self.assertEqual(keeper.read_bytes(), before)
 
+    def test_nvidia_offload_request_preserves_the_laptop_desktop_environment(self):
+        launcher = self.module()
+        desktop = {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}
+        result = launcher.obs_environment(desktop)
+        self.assertEqual(result["__NV_PRIME_RENDER_OFFLOAD"], "1")
+        self.assertEqual(result["__GLX_VENDOR_LIBRARY_NAME"], "nvidia")
+        self.assertEqual(result["WAYLAND_DISPLAY"], desktop["WAYLAND_DISPLAY"])
+        self.assertEqual(desktop, {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"})
+
     def test_preview_hold_uses_the_unique_collection_without_auto_streaming(self):
         launcher = self.module()
         self.assertTrue(hasattr(launcher, "obs_arguments"), "preview hold interlock is missing")

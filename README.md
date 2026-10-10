@@ -5,9 +5,9 @@
 The `--zap` installation mode uses this route:
 
 ```text
-OBS -> nginx on localhost:1935/local/lightning-goats
-       |-> YouTube
-       |-> FFmpeg (720p30) -> zap.stream -> public HLS playback and the NIP-53 live event
+OBS (NVENC, 1080p30, 3 Mbps) -> nginx on localhost:1935/local/lightning-goats
+                              |-> native RTMP push -> YouTube
+                              |-> native RTMP push -> zap.stream -> HLS / NIP-53
 ```
 
 `nostr-stream zap` authenticates API requests through the local NIP-46 bunker.
@@ -16,10 +16,7 @@ The identity nsec stays in the bunker. The client credential must match
 
 ```bash
 ./install.sh --zap
-sudo install -m 755 bin/lightning-goats-nginx-routes bin/lightning-goats-zap-relay /usr/local/libexec/
-sudo install -m 644 systemd/lightning-goats-zap-relay.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now lightning-goats-zap-relay.service
+sudo install -m 755 bin/lightning-goats-nginx-routes /usr/local/libexec/
 nostr-stream zap account
 nostr-stream zap metadata --file ~/.config/nostr-stream/zap-metadata.json
 nostr-stream zap metadata --file metadata.json --stream-id ZAP_STREAM_UUID
@@ -37,26 +34,28 @@ The zap.stream API does not provide YouTube credentials.
 
 The updater accepts only YouTube's ingest host and `*.zap.stream`, writes
 `/etc/nginx/stream-destinations.conf` with mode 600, validates nginx, and reloads
-it when a destination changes, then refreshes the remux relay credential. A lock
-serializes concurrent updates. Failed
-validation restores the previous file.
+it when a destination changes. A lock serializes updates. Failed validation
+restores the previous file; a failed reload also reapplies the previous running
+configuration. Keys remain in this root-owned file, outside process arguments.
+
 Include that file inside nginx's `application local` block. Keep the RTMP
-listener on `127.0.0.1:1935`, and expose `rtmp_stat all` only at
-`http://127.0.0.1:8089/stat`. Use `worker_processes 1` so every statistics
-request sees the local publisher. The destinations file contains the YouTube
-`push` and a private `# zap-relay` destination consumed by the system relay
-service through `LoadCredential`. The relay uses NVENC to encode zap.stream video at 720p30 and 2.5 Mbps,
-with two-second keyframes, and copies audio. YouTube retains OBS's original
-1080p feed. This leaves headroom on the measured upload path to the UK server.
-The relay limits decoder and filter threads and runs at lower CPU priority
-to protect OBS rendering. It reconnects after failures and waits for OBS
-through nginx.
-FFmpeg with working `h264_nvenc` support and the system `librtmp.so.1`
-library are required. FFmpeg writes to
-a pipe, and the relay publishes through librtmp with the private destination
-kept in memory; ingest keys stay out of process arguments. This avoids an observed compatibility failure where
-nginx's direct push received `NetStream.Publish.Start` but zap.stream never
-produced playable video.
+listener on loopback and use one worker, `chunk_size 4096`, `push_reconnect 1s`,
+`idle_streams off`, `wait_key on`, `wait_video on`, and `meta publish`. Disable
+RTMP access logging with `access_log off` in the `rtmp` block.
+OBS provides the only video encoding, using NVIDIA NVENC. Nginx forwards the
+same encoded video and audio directly to both endpoints without transcoding,
+remux processes, or custom publishers. OBS graphics device selection must be
+verified in its startup log; PRIME environment variables alone do not guarantee
+NVIDIA rendering in the Snap/Wayland installation.
+
+The installed nginx RTMP module needs the small compatibility patch in
+`nginx/rtmp-publish-metadata.patch`. Standard `meta on` and `meta copy` strip
+`@setDataFrame`, but zap.stream's RTMP receiver requires that envelope before
+it initializes its FLV input. The patch adds opt-in `meta publish`, retaining
+normal metadata behavior for other applications. Build it against the exact
+installed nginx version with `--with-compat`; validate an isolated nginx
+instance and its outgoing metadata before deployment. Rebuild the module after
+nginx upgrades. Keep the distribution module and prior configuration for rollback.
 
 Enable `nak-bunker.service` and `nostr-stream-zap.service`. Leave
 `youtube-nostr-watch.service` disabled in this mode to avoid another live event.
