@@ -5,6 +5,7 @@ import argparse
 import getpass
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,13 @@ APPROVED_CLIENT = "5302cd2bfe2dcc76c5a9abcba74e6c5f1a07444b35c25e0cd74bac5b453fb
 
 class CredentialError(Exception):
     pass
+
+
+def resolve_nak_binary(which=shutil.which):
+    path = which("nak")
+    if path:
+        return Path(path)
+    raise CredentialError("nak was not found in PATH.")
 
 
 def save_credential(destination, encrypted):
@@ -38,11 +46,11 @@ def provision(key, approved, destination, nak):
     if result.returncode or result.stdout.decode().strip() != approved:
         raise CredentialError("This private key does not match the approved client public key.")
     result = subprocess.run(
-        ["sudo", "-n", "systemd-creds", "encrypt", "--user", f"--uid={os.getuid()}",
+        ["systemd-creds", "encrypt", "--user", f"--uid={os.getuid()}",
          "--with-key=host", "--name=nostr-client", "-", "-"],
         input=key.encode(), capture_output=True, timeout=30)
     if result.returncode:
-        raise CredentialError("Credential encryption failed. Check that sudo -n true succeeds.")
+        raise CredentialError("Credential encryption failed; check the user systemd credential key support.")
     encrypted = result.stdout
     check = subprocess.run(
         ["systemd-creds", "decrypt", "--user", "--name=nostr-client", "-", "-"],
@@ -65,7 +73,7 @@ def main():
     print("Enter the CLIENT private key (nsec or hex). Input will be hidden.")
     key = getpass.getpass("Client private key: ")
     destination = home / ".config/nak/credentials/nostr-client.cred"
-    provision(key, APPROVED_CLIENT, destination, home / ".local/bin/nak")
+    provision(key, APPROVED_CLIENT, destination, resolve_nak_binary())
     print(f"Credential verified and saved with mode 600: {destination}")
     print("The bunker's existing signing credential was left unchanged.")
 

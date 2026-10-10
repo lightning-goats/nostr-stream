@@ -1,0 +1,51 @@
+load_module /usr/lib64/nginx/modules/ngx_rtmp_module.so;
+
+user nginx;
+worker_processes 1;
+error_log /var/log/nginx/error.log warn;
+pid /run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    access_log off;
+    server_tokens off;
+
+    server {
+        listen 127.0.0.1:8089;
+        server_name localhost;
+
+        location = /stat {
+            allow 127.0.0.1;
+            deny all;
+            rtmp_stat all;
+        }
+    }
+}
+
+rtmp {
+    server {
+        listen 127.0.0.1:1935;
+        access_log off;
+        chunk_size 4096;
+        timeout 30s;
+        ping 30s;
+        ping_timeout 10s;
+        notify_method get;
+
+        application local {
+            live on;
+            record off;
+            meta publish;
+            push_reconnect 1s;
+            idle_streams off;
+            wait_key on;
+            wait_video on;
+            allow publish 127.0.0.1;
+            deny publish all;
+            include /etc/nginx/stream-destinations.conf;
+        }
+    }
+}

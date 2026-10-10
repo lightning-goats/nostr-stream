@@ -1,14 +1,21 @@
 # Lightning Goats Nostr Stream
 
-## OBS with local nginx and zap.stream
+## Current deployment: Intel/Flatpak OBS, nginx, and zap.stream
 
 The `--zap` installation mode uses this route:
 
 ```text
-OBS (NVENC, 1080p30, 3 Mbps) -> nginx on localhost:1935/local/lightning-goats
+OBS (Intel VA-API H.264) -> nginx on localhost:1935/local/lightning-goats
                               |-> native RTMP push -> YouTube
                               |-> native RTMP push -> zap.stream -> HLS / NIP-53
 ```
+
+The Fedora 44 ThinkPad uses Flatpak OBS (`com.obsproject.Studio`) in its
+existing Wayland session. The launcher discovers the active OBS profile and
+scene collection from this installation and preserves its scenes, browser
+sources, overlay, and encoder settings. The current profile outputs 1280x720
+at 30 fps, 6 Mbps CBR, high profile, and a 250-frame GOP. Keep these working
+VA-API settings as the migration baseline.
 
 `nostr-stream zap` authenticates API requests through the local NIP-46 bunker.
 The identity nsec stays in the bunker. The client credential must match
@@ -42,18 +49,13 @@ Include that file inside nginx's `application local` block. Keep the RTMP
 listener on loopback and use one worker, `chunk_size 4096`, `push_reconnect 1s`,
 `idle_streams off`, `wait_key on`, `wait_video on`, and `meta publish`. Disable
 RTMP access logging with `access_log off` in the `rtmp` block.
-OBS provides the only video encoding, using NVIDIA NVENC. Nginx forwards the
-same encoded video and audio directly to both endpoints without transcoding,
-remux processes, or custom publishers. The launcher uses NVIDIA PRIME with
-XWayland (`XDG_SESSION_TYPE=x11`, `QT_QPA_PLATFORM=xcb`) so this OBS Snap
-selects the NVIDIA GPU for scene rendering as well as NVENC encoding. The
-interface stays on the laptop display. Native Wayland selected Intel on this
-host despite PRIME variables; verify the selected adapter in the startup log.
-The host uses the existing Balanced power profile (`powerprofilesctl set balanced`)
-to reduce CPU heat while keeping NVIDIA rendering and encoding active. In
-Performance mode, the CPU repeatedly exceeded 90°C with intermittent missed frames.
+OBS does the only video encoding. nginx forwards the same encoded video and
+audio directly to both endpoints without transcoding. The Fedora launcher
+uses the existing Wayland session and injects no NVIDIA environment settings.
+OBS configuration is at
+`~/.var/app/com.obsproject.Studio/config/obs-studio/`.
 
-The host uses the kernel's installed BBR TCP congestion control. With CUBIC,
+The earlier Dell host used the kernel's installed BBR TCP congestion control. With CUBIC,
 the UK zap ingest connection accumulated about 750 KB of unsent data and nginx
 dropped frames. A two-minute BBR check held 30 fps with no relay or OBS drops;
 public zap video had regular 33 ms frame timestamps. Install the existing
@@ -64,10 +66,12 @@ sudo install -m 644 config/90-lightning-goats-stream.conf /etc/sysctl.d/
 sudo sysctl -p /etc/sysctl.d/90-lightning-goats-stream.conf
 ```
 
-It applies to new TCP connections on this host. Existing nginx connections
+That historical tuning applies to new TCP connections on that host. Existing nginx connections
 need one brief reconnect when switching algorithms. The kernel autoloads the
 installed `tcp_bbr` module. Retain the existing `fq_codel` queue discipline.
-To revert, remove this file and run
+Do not apply this sysctl on the Fedora ThinkPad without operator approval; its
+kernel currently offers `reno` and `cubic`. To revert the legacy host, remove
+this file and run
 `sudo sysctl -w net.ipv4.tcp_congestion_control=cubic`; reconnect nginx only
 when needed to change its established sockets.
 
@@ -92,21 +96,30 @@ zap.stream owns live/ended status and the playback URL. The watcher accepts
 its UK regional service address and chooses HTTPS playback when events also
 advertise another transport.
 
-The zap installer wires desktop and login launchers to `lightning-goats-obs`. It refreshes ingest
+The zap installer wires desktop launchers to `lightning-goats-obs` and only
+retargets an autostart entry if one already exists. It refreshes ingest
 destinations, initializes metadata, restores OBS's local nginx destination, and
 launches OBS with streaming enabled. Existing OBS service settings are backed
 up privately before replacement. Close and reopen an already-running OBS
-instance to load the new service settings. The launcher selects the uniquely
-named `Lightning Goats` scene collection and the `Untitled` profile. Preserve
-the camera and overlay in that collection. To open a stopped preview during
-repairs, create `~/.config/nostr-stream/hold-stream`; remove it after verifying
-the picture to restore automatic streaming on startup.
+instance to load the new service settings. The launcher discovers the active
+profile and scene collection. To open a stopped preview during repairs, create
+`~/.config/nostr-stream/hold-stream`; remove it after verifying the picture to
+restore streaming when the launcher runs.
+
+The Fedora nginx module build, SELinux port setup, loopback configuration, and
+rollback are documented in [nginx/README.md](nginx/README.md). Installation
+does not start a public stream. A supervised live test requires operator
+approval.
 
 Run regression tests with `python3 -m unittest discover -s tests -v`. The tests
 use generated, disposable identities and local HTTP fixtures; they do not
 publish public events or use deployment credentials.
 
-## Original YouTube watcher with self-hosted HLS
+## Legacy YouTube watcher with self-hosted HLS
+
+This section describes the older YouTube-only deployment and self-hosted HLS
+architecture. It is not the current Fedora zap.stream publishing path. Keep
+`youtube-nostr-watch.service` disabled when using the zap watcher.
 
 Self-hosted Nostr live-stream publishing for the Lightning Goats YouTube channel and Lightning Goats HLS endpoint.
 

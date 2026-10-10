@@ -195,7 +195,7 @@ publish_with_relays() {
                 --signal=TERM \
                 --kill-after=2s \
                 15s \
-                "$NAK" --connect-timeout 5s event --github \
+                "$NAK" --connect-timeout 5s event \
                     --sec "$bunker" \
                     "$@" \
                     "${target_relays[@]}" \

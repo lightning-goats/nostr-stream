@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,20 @@ METADATA_FIELDS = {"title", "summary", "image", "tags", "content_warning", "goal
 
 class ZapError(Exception):
     pass
+
+
+def resolve_nak_binary(which=shutil.which):
+    path = which("nak")
+    if path:
+        return Path(path)
+    raise ZapError("nak was not found in PATH.")
+
+
+def resolve_ytdlp_binary(which=shutil.which):
+    path = which("yt-dlp")
+    if path:
+        return Path(path)
+    raise ZapError("yt-dlp was not found in PATH.")
 
 
 def validate_metadata(value):
@@ -59,9 +74,18 @@ def ingest_destinations(account, youtube):
             "zap": {"server": endpoint["url"], "key": endpoint["key"]}}
 
 
+def load_youtube_service(path):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        raise ZapError("YouTube ingest credentials are not provisioned on this host.") from None
+    except json.JSONDecodeError:
+        raise ZapError("The saved YouTube ingest configuration is invalid.") from None
+
+
 class RemoteSigner:
     def __init__(self, home):
-        self.nak = home / ".local/bin/nak"
+        self.nak = resolve_nak_binary()
         config = home / ".config/nak"
         self.public_key = (config / "bunker.pub").read_text().strip()
         approved = (config / "authorized-client.pub").read_text().strip()
@@ -90,7 +114,7 @@ class RemoteSigner:
         for relay in RELAYS:
             bunker = (f"bunker://{self.public_key}?relay="
                       + urllib.parse.quote(relay, safe=""))
-            command = [str(self.nak), "event", "--github", "--sec", bunker,
+            command = [str(self.nak), "event", "--sec", bunker,
                        "-k", "27235", "-c", ""]
             for name, value in tags:
                 command += ["-t", f"{name}={value}"]
@@ -337,7 +361,7 @@ class Watcher:
 
 def youtube_state(home, url="https://www.youtube.com/@lightning-goats/live"):
     result = subprocess.run(
-        [str(home / ".local/bin/yt-dlp"), "--no-warnings", "--skip-download",
+        [str(resolve_ytdlp_binary()), "--no-warnings", "--skip-download",
          "--ignore-no-formats-error", "--socket-timeout", "8", "--retries", "0",
          "--print", "%(live_status)s|%(id)s", url],
         capture_output=True, text=True, timeout=30)
@@ -404,7 +428,8 @@ def main():
     if args.command == "account":
         print(json.dumps(redact(api.request("GET", "account")), indent=2))
     elif args.command == "sync-ingest":
-        youtube = json.loads((Path.home() / ".config/nostr-stream/youtube-service.json").read_text())
+        youtube_path = Path.home() / ".config/nostr-stream/youtube-service.json"
+        youtube = load_youtube_service(youtube_path)
         destinations = ingest_destinations(api.request("GET", "account"), youtube)
         result = subprocess.run(
             ["sudo", "-n", "/usr/local/libexec/lightning-goats-nginx-routes"],

@@ -2,10 +2,13 @@
 """Restore the local nginx destination before starting the Lightning Goats stream."""
 
 import argparse
+import configparser
 import datetime
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -14,16 +17,88 @@ import time
 import urllib.parse
 
 
+OBS_APP_ID = "com.obsproject.Studio"
+
+
+def obs_config_directory(home, platform):
+    if platform == "flatpak":
+        return home / ".var/app/com.obsproject.Studio/config/obs-studio"
+    if platform == "snap":
+        return home / "snap/obs-studio/common/.config/obs-studio"
+    if platform == "native":
+        return home / ".config/obs-studio"
+    raise ValueError("Unsupported OBS installation type.")
+
+
+def detect_obs_platform(home, which=shutil.which, run=subprocess.run,
+                        snap_path=Path("/snap/bin/obs-studio")):
+    flatpak = which("flatpak")
+    if flatpak:
+        try:
+            result = run([flatpak, "info", OBS_APP_ID], capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result is not None and result.returncode == 0:
+            return "flatpak", obs_config_directory(home, "flatpak"), flatpak
+
+    for name in ("obs", "obs-studio"):
+        executable = which(name)
+        if executable:
+            return "native", obs_config_directory(home, "native"), executable
+
+    if snap_path.is_file():
+        return "snap", obs_config_directory(home, "snap"), str(snap_path)
+    raise RuntimeError("OBS was not found as Flatpak, native, or Snap.")
+
+
+def discover_obs_configuration(config_dir):
+    basic = config_dir / "basic"
+    profiles = sorted(path.name for path in (basic / "profiles").iterdir()
+                      if path.is_dir() and (path / "basic.ini").is_file())
+    collections = sorted(path.stem for path in (basic / "scenes").glob("*.json")
+                         if not path.name.endswith(".bak"))
+    if not profiles:
+        raise RuntimeError("No OBS profile with a basic.ini file was found.")
+    if not collections:
+        raise RuntimeError("No OBS scene collection was found.")
+
+    settings = configparser.ConfigParser(interpolation=None)
+    settings.read(config_dir / "global.ini", encoding="utf-8")
+    configured = {key.lower(): value.strip() for section in settings.sections()
+                  for key, value in settings.items(section)}
+
+    def select(available, keys, label):
+        for key in keys:
+            value = configured.get(key.lower(), "")
+            if value:
+                value = Path(value).name
+                if value.endswith(".json"):
+                    value = value[:-5]
+                if value in available:
+                    return value
+        if len(available) == 1:
+            return available[0]
+        raise RuntimeError(f"Cannot determine the active OBS {label}; select it in OBS first.")
+
+    profile = select(profiles, ("Profile", "ProfileDir"), "profile")
+    collection = select(collections, ("SceneCollection", "SceneCollectionFile"), "scene collection")
+    return profile, collection
+
+
 def capture_youtube_profile(profile, destination):
+    if not profile.is_file():
+        return False
     data = profile.read_bytes()
     current = json.loads(data)
     settings = current.get("settings", {})
     hostname = urllib.parse.urlsplit(settings.get("server", "")).hostname
-    if hostname not in {"a.rtmp.youtube.com", "a.rtmps.youtube.com", "b.rtmp.youtube.com", "b.rtmps.youtube.com"}:
-        return
+    if hostname not in {"a.rtmp.youtube.com", "a.rtmps.youtube.com",
+                        "b.rtmp.youtube.com", "b.rtmps.youtube.com"}:
+        return False
     if not settings.get("key"):
         raise RuntimeError("The selected YouTube profile has no stream key.")
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination.parent.chmod(0o700)
     descriptor, name = tempfile.mkstemp(dir=destination.parent)
     try:
         with os.fdopen(descriptor, "wb") as output:
@@ -32,21 +107,25 @@ def capture_youtube_profile(profile, destination):
         os.replace(name, destination)
     finally:
         Path(name).unlink(missing_ok=True)
+    return True
 
 
 def configure_profile(profile, backups):
-    original = profile.read_bytes()
-    json.loads(original)  # Reject a damaged profile before replacing it.
+    profile.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     desired = {"type": "rtmp_custom", "settings": {
         "server": "rtmp://127.0.0.1:1935/local", "key": "lightning-goats", "use_auth": False}}
-    if json.loads(original) == desired:
-        return
-    backups.mkdir(parents=True, exist_ok=True, mode=0o700)
-    stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
-    backup = backups / f"service-{stamp}.json"
-    with backup.open("xb") as output:
-        os.fchmod(output.fileno(), 0o600)
-        output.write(original)
+    if profile.is_file():
+        original = profile.read_bytes()
+        if json.loads(original) == desired:
+            return
+        backups.mkdir(parents=True, exist_ok=True, mode=0o700)
+        backups.chmod(0o700)
+        stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+        backup = backups / f"service-{stamp}.json"
+        with backup.open("xb") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(original)
+
     descriptor, name = tempfile.mkstemp(dir=profile.parent)
     try:
         with os.fdopen(descriptor, "w") as output:
@@ -59,49 +138,172 @@ def configure_profile(profile, backups):
 
 
 def obs_environment(desktop):
-    environment = dict(desktop)
-    environment["__NV_PRIME_RENDER_OFFLOAD"] = "1"
-    environment["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
-    # The Snap can initialize NVIDIA EGL on XWayland; Wayland selects Intel.
-    environment["XDG_SESSION_TYPE"] = "x11"
-    environment["QT_QPA_PLATFORM"] = "xcb"
-    return environment
+    return dict(desktop)
 
 
-def obs_arguments(hold):
-    arguments = ["/snap/bin/obs-studio", "--profile", "Untitled",
-                 "--collection", "Lightning Goats"]
+def obs_arguments(hold, profile, collection, platform, executable=None):
+    if platform == "flatpak":
+        arguments = [executable or "flatpak", "run", OBS_APP_ID]
+    elif platform in {"native", "snap"}:
+        arguments = [executable or ("obs" if platform == "native" else "/snap/bin/obs-studio")]
+    else:
+        raise ValueError("Unsupported OBS installation type.")
+    arguments += ["--profile", profile, "--collection", collection]
     if not hold:
         arguments.append("--startstreaming")
     return arguments
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="Verify readiness without launching OBS")
-    args = parser.parse_args()
-    home = Path.home()
-    profile = home / "snap/obs-studio/common/.config/obs-studio/basic/profiles/Untitled/service.json"
-    hold = (home / ".config/nostr-stream/hold-stream").exists()
-    if hold:
-        if args.check:
-            print("Streaming is held for preview verification.")
-            return
-        os.execve("/snap/bin/obs-studio", obs_arguments(True), obs_environment(os.environ))
-    capture_youtube_profile(profile, home / ".config/nostr-stream/youtube-service.json")
-    deadline = time.monotonic() + 20
+def _launcher_desktop_text(content, launcher):
+    lines = content.splitlines()
+    output = []
+    section = ""
+    exec_written = False
+    dbus_written = False
+    marker_written = False
+    for line in lines:
+        if line.startswith("["):
+            if section == "Desktop Entry":
+                if not exec_written:
+                    output.append(f"Exec={launcher}")
+                if not dbus_written:
+                    output.append("DBusActivatable=false")
+                if not marker_written:
+                    output.append("X-LightningGoats-Launcher=true")
+            section = line[1:-1]
+            output.append(line)
+            continue
+        if section == "Desktop Entry" and line.startswith("Exec="):
+            if not exec_written:
+                output.append(f"Exec={launcher}")
+                exec_written = True
+            continue
+        if section == "Desktop Entry" and line.startswith("DBusActivatable="):
+            output.append("DBusActivatable=false")
+            dbus_written = True
+            continue
+        if section == "Desktop Entry" and line.startswith("X-LightningGoats-Launcher="):
+            output.append("X-LightningGoats-Launcher=true")
+            marker_written = True
+            continue
+        output.append(line)
+    if section == "Desktop Entry":
+        if not exec_written:
+            output.append(f"Exec={launcher}")
+        if not dbus_written:
+            output.append("DBusActivatable=false")
+        if not marker_written:
+            output.append("X-LightningGoats-Launcher=true")
+    if "[Desktop Entry]" not in output:
+        output = ["[Desktop Entry]", "Type=Application", "Name=Lightning Goats OBS",
+                  f"Exec={launcher}", "DBusActivatable=false", "X-LightningGoats-Launcher=true"]
+    return "\n".join(output) + "\n"
+
+
+def _atomic_text(path, content, mode):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, name = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as output:
+            os.fchmod(output.fileno(), mode)
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def _backup_once(path, state_dir):
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state_dir.chmod(0o700)
+    backup = state_dir / f"{path.name}.original"
+    if path.is_file() and not backup.exists():
+        descriptor, name = tempfile.mkstemp(dir=state_dir)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                os.fchmod(output.fileno(), 0o600)
+                output.write(path.read_bytes())
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(name, backup)
+        finally:
+            Path(name).unlink(missing_ok=True)
+
+
+def write_desktop_integration(home, launcher, source=None):
+    if source is None:
+        candidates = (
+            home / ".local/share/flatpak/exports/share/applications/com.obsproject.Studio.desktop",
+            Path("/var/lib/flatpak/exports/share/applications/com.obsproject.Studio.desktop"),
+            Path("/usr/share/applications/com.obsproject.Studio.desktop"),
+            Path("/var/lib/snapd/desktop/applications/obs-studio_obs-studio.desktop"),
+        )
+        source = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if source and source.is_file():
+        content = source.read_text(encoding="utf-8")
+    else:
+        content = "[Desktop Entry]\nType=Application\nName=Lightning Goats OBS\n"
+
+    state_dir = home / ".local/state/nostr-stream-zap/desktop-backups"
+    applications = home / ".local/share/applications"
+    target = applications / "com.obsproject.Studio.desktop"
+    updated = _launcher_desktop_text(content, launcher)
+    if not target.is_file() or target.read_text(encoding="utf-8") != updated:
+        _backup_once(target, state_dir)
+        _atomic_text(target, updated, 0o644)
+
+    autostart = home / ".config/autostart"
+    if autostart.is_dir():
+        for path in sorted(autostart.glob("*.desktop")):
+            existing = path.read_text(encoding="utf-8", errors="replace")
+            if not re.search(r"(?im)^Exec=.*(?:com\.obsproject\.Studio|\bobs(?:-studio)?\b)", existing):
+                continue
+            replacement = _launcher_desktop_text(existing, launcher)
+            if replacement != existing:
+                _backup_once(path, state_dir)
+                _atomic_text(path, replacement, 0o644)
+
+
+def install_desktop_integration(home, launcher):
+    write_desktop_integration(home, launcher)
+
+
+def wait_for_nginx_listener(timeout=20):
+    deadline = time.monotonic() + timeout
     while True:
         try:
             with socket.create_connection(("127.0.0.1", 1935), timeout=1):
-                break
+                return
         except OSError:
             if time.monotonic() >= deadline:
                 raise RuntimeError("nginx is not listening on localhost:1935; OBS was not launched.")
             time.sleep(1)
-    # Metadata is initialized before zap.stream creates the new live event.
-    result = subprocess.run(
-        [str(home / ".local/bin/nostr-stream"), "zap", "sync-ingest"],
-        capture_output=True, timeout=100)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="Verify readiness without launching OBS")
+    parser.add_argument("--install-desktop", action="store_true",
+                        help="Install one OBS desktop override and retarget existing OBS autostart")
+    args = parser.parse_args()
+    home = Path.home()
+    if args.install_desktop:
+        install_desktop_integration(home, Path(sys.argv[0]).resolve())
+        return
+    platform, config_dir, executable = detect_obs_platform(home)
+    profile_name, collection_name = discover_obs_configuration(config_dir)
+    profile = config_dir / "basic/profiles" / profile_name / "service.json"
+    youtube_profile = home / ".config/nostr-stream/youtube-service.json"
+    hold = (home / ".config/nostr-stream/hold-stream").exists()
+
+    wait_for_nginx_listener()
+    capture_youtube_profile(profile, youtube_profile)
+    if not youtube_profile.is_file():
+        raise RuntimeError("No saved YouTube ingest key is available; configure it in OBS once before migration.")
+
+    result = subprocess.run([str(home / ".local/bin/nostr-stream"), "zap", "sync-ingest"],
+                            capture_output=True, timeout=100)
     if result.returncode:
         raise RuntimeError("Refreshing nginx's ingest destinations failed; OBS was not launched.")
     result = subprocess.run(
@@ -109,11 +311,14 @@ def main():
          str(home / ".config/nostr-stream/zap-metadata.json")], capture_output=True, timeout=90)
     if result.returncode:
         raise RuntimeError("zap.stream metadata initialization failed; OBS was not launched.")
+
     configure_profile(profile, home / ".local/state/obs-config-backups/launcher")
     if args.check:
         print("nginx routing and zap.stream metadata are ready; OBS was not launched.")
         return
-    os.execve("/snap/bin/obs-studio", obs_arguments(False), obs_environment(os.environ))
+
+    arguments = obs_arguments(hold, profile_name, collection_name, platform, executable)
+    os.execvpe(arguments[0], arguments, obs_environment(os.environ))
 
 
 if __name__ == "__main__":

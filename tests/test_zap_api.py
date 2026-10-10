@@ -70,6 +70,20 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("private-ingest-key", json.dumps(result))
         self.assertNotIn("private-password", json.dumps(result))
 
+    def test_nak_is_resolved_from_path_instead_of_a_dell_home_directory(self):
+        zap = module(self)
+        self.assertEqual(zap.resolve_nak_binary(lambda name: "/usr/local/bin/nak"),
+                         Path("/usr/local/bin/nak"))
+        with self.assertRaisesRegex(zap.ZapError, "nak.*PATH"):
+            zap.resolve_nak_binary(lambda name: None)
+
+    def test_youtube_probe_resolves_ytdlp_from_path_and_reports_missing_dependency(self):
+        zap = module(self)
+        self.assertEqual(zap.resolve_ytdlp_binary(lambda name: "/usr/bin/yt-dlp"),
+                         Path("/usr/bin/yt-dlp"))
+        with self.assertRaisesRegex(zap.ZapError, "yt-dlp.*PATH"):
+            zap.resolve_ytdlp_binary(lambda name: None)
+
     def test_ingest_refresh_uses_the_current_basic_endpoint_and_preserves_youtube_key(self):
         zap = module(self)
         self.assertTrue(hasattr(zap, "ingest_destinations"), "current account ingest selection is missing")
@@ -80,6 +94,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(zap.ingest_destinations(account, youtube), {
             "youtube": {"server": "rtmp://a.rtmp.youtube.com/live2", "key": "saved-youtube-key"},
             "zap": {"server": "rtmp://in.uk.zap.stream:1935/basic", "key": "current-key"}})
+
+    def test_missing_youtube_ingest_credentials_fail_with_a_safe_prerequisite_message(self):
+        zap = module(self)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "youtube-service.json"
+            with self.assertRaisesRegex(zap.ZapError, "not provisioned"):
+                zap.load_youtube_service(path)
 
     def test_stat_only_reports_the_selected_publisher(self):
         zap = module(self)

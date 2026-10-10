@@ -1,13 +1,14 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NAK = Path("/home/goats/.local/bin/nak")
+NAK = Path(shutil.which("nak") or "/home/goats/.local/bin/nak")
 
 
 class PrepareTests(unittest.TestCase):
@@ -29,9 +30,10 @@ class PrepareTests(unittest.TestCase):
             (tools / "nak").write_text('''#!/usr/bin/python3
 import json, os, subprocess, sys
 args = sys.argv[1:]
-args = args[args.index("event") + 1:]
-if "--github" not in args:
+if "--github" in args:
+    print("installed nak does not support the obsolete --github option", file=sys.stderr)
     sys.exit(4)
+args = args[args.index("event") + 1:]
 index = args.index("--sec")
 del args[index:index+2]
 args = [arg for arg in args if arg not in {"nos.lol", "relay.damus.io", "nostr.chaima.info", "lnb.bolverker.com/nostrrelay/666"}]
@@ -54,7 +56,7 @@ sys.exit(result.returncode)
                        "https://www.youtube.com/watch?v=abcdefghijk"]
             for attempt in range(2):
                 result = subprocess.run(command, capture_output=True, text=True, env=env)
-                self.assertEqual(result.returncode, 0, "prepare command did not succeed")
+                self.assertEqual(result.returncode, 0, f"prepare command did not succeed: {result.stderr}")
             published = [json.loads(line) for line in events.read_text().splitlines()]
             self.assertEqual([event["kind"] for event in published], [9041, 1])
             self.assertEqual(dict((tag[:2] for tag in published[1]["tags"]))["goal"], published[0]["id"])

@@ -41,6 +41,20 @@ if __name__ == '__main__':
     parser.add_argument('--module', type=Path, required=True)
     parser.add_argument('--fixture', type=Path, required=True, help='Existing H.264/AAC media with at least two seconds of video')
     args = parser.parse_args()
+    ports = (19451, 19452, 19453)
+    occupied = []
+    for port in ports:
+        probe = socket.socket()
+        try:
+            probe.bind(('127.0.0.1', port))
+        except OSError:
+            occupied.append(port)
+        finally:
+            probe.close()
+    if occupied:
+        raise SystemExit(f'Refusing isolated metadata test; loopback ports occupied: {occupied}')
+    if not args.module.is_file() or not args.fixture.is_file():
+        raise SystemExit('Module and fixture must both be regular files')
     for mode, expected in [('on', False), ('copy', False), ('publish', True)]:
         metadata, wrapped = run(mode, str(args.module.resolve()), args.fixture.resolve())
         if not metadata or wrapped != expected:
