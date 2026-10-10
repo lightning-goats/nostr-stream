@@ -1,5 +1,5 @@
 [Unit]
-Description=Lightning Goats nginx feed to zap.stream remux relay
+Description=Lightning Goats nginx feed to zap.stream video relay
 After=network-online.target nginx.service
 Wants=network-online.target
 Requires=nginx.service

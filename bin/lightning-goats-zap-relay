@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Remux the local nginx feed for zap.stream without re-encoding."""
+"""Encode the local nginx feed for reliable zap.stream delivery."""
 import ctypes
 import os
 import subprocess
@@ -21,7 +21,10 @@ def destination(routes):
 def ffmpeg_arguments():
     return ['/usr/bin/ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'quiet',
             '-i', 'rtmp://127.0.0.1:1935/local/lightning-goats',
-            '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy',
+            '-map', '0:v:0', '-map', '0:a:0?',
+            '-vf', 'scale=1280:720,fps=30', '-c:v', 'h264_nvenc', '-preset', 'p4',
+            '-rc', 'cbr', '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k',
+            '-g', '60', '-bf', '2', '-pix_fmt', 'yuv420p', '-c:a', 'copy',
             '-flvflags', 'no_duration_filesize', '-f', 'flv', 'pipe:1']
 
 

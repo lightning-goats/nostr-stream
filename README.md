@@ -7,7 +7,7 @@ The `--zap` installation mode uses this route:
 ```text
 OBS -> nginx on localhost:1935/local/lightning-goats
        |-> YouTube
-       |-> FFmpeg (copy) -> zap.stream -> public HLS playback and the NIP-53 live event
+       |-> FFmpeg (720p30) -> zap.stream -> public HLS playback and the NIP-53 live event
 ```
 
 `nostr-stream zap` authenticates API requests through the local NIP-46 bunker.
@@ -45,9 +45,12 @@ listener on `127.0.0.1:1935`, and expose `rtmp_stat all` only at
 `http://127.0.0.1:8089/stat`. Use `worker_processes 1` so every statistics
 request sees the local publisher. The destinations file contains the YouTube
 `push` and a private `# zap-relay` destination consumed by the system relay
-service through `LoadCredential`. The relay copies video and audio without
-re-encoding; it reconnects after failures and waits for OBS through nginx.
-FFmpeg and the system `librtmp.so.1` library are required. FFmpeg writes to
+service through `LoadCredential`. The relay uses NVENC to encode zap.stream video at 720p30 and 2.5 Mbps,
+with two-second keyframes, and copies audio. YouTube retains OBS's original
+1080p feed. This leaves headroom on the measured upload path to the UK server.
+The relay reconnects after failures and waits for OBS through nginx.
+FFmpeg with working `h264_nvenc` support and the system `librtmp.so.1`
+library are required. FFmpeg writes to
 a pipe, and the relay publishes through librtmp with the private destination
 kept in memory; ingest keys stay out of process arguments. This avoids an observed compatibility failure where
 nginx's direct push received `NetStream.Publish.Start` but zap.stream never
