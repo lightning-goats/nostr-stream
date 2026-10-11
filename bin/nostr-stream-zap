@@ -316,7 +316,7 @@ class Watcher:
         self.poll_pending()
         if not self.publishing():
             if self.sync.state.get("url"):
-                status, _ = self.youtube()
+                status = self.youtube()[0]
                 if status in {"OFFLINE", "not_live", "was_live", "post_live", "is_upcoming"}:
                     self.offline_checks += 1
                     if self.offline_checks >= 3:
@@ -328,30 +328,45 @@ class Watcher:
         event = find_live_event(self.events(), self.host, self.service)
         if not event:
             return "OBS is streaming; waiting for zap.stream's live event."
-        status, url = self.youtube()
+        status, url, *thumbnail = self.youtube()
         if status != "is_live":
             return "OBS is streaming; waiting for YouTube's live broadcast."
+        if thumbnail and thumbnail[0]:
+            metadata["image"] = thumbnail[0]
         self.sync.sync(url, event, metadata)
         return f"zap.stream metadata synchronized: {event['playback']}"
 
 
-def youtube_state(home, url="https://www.youtube.com/@lightning-goats/live"):
+def youtube_state(home, url="https://www.youtube.com/@lightning-goats/live", *, include_thumbnail=False):
     result = subprocess.run(
         [str(home / ".local/bin/yt-dlp"), "--no-warnings", "--skip-download",
          "--ignore-no-formats-error", "--socket-timeout", "8", "--retries", "0",
-         "--print", "%(live_status)s|%(id)s", url],
+         "--print", '{"status":%(live_status)j,"id":%(id)j,"thumbnail":%(thumbnail)j}', url],
         capture_output=True, text=True, timeout=30)
     if result.returncode:
         if "not currently live" in result.stderr.lower():
-            return "OFFLINE", ""
+            return ("OFFLINE", "", "") if include_thumbnail else ("OFFLINE", "")
         raise ZapError("YouTube status check failed; keeping current goal state.")
-    lines = result.stdout.strip().splitlines()
-    if not lines or "|" not in lines[-1]:
+    try:
+        info = json.loads(result.stdout.strip().splitlines()[-1])
+        status, video_id = info["status"], info["id"]
+    except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+        raise ZapError("YouTube returned no usable broadcast metadata.") from None
+    if not isinstance(status, str) or not isinstance(video_id, str):
         raise ZapError("YouTube returned no usable broadcast metadata.")
-    status, video_id = lines[-1].split("|", 1)
     if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
         raise ZapError("YouTube returned an invalid video ID.")
-    return status, "https://www.youtube.com/watch?v=" + video_id
+    watch_url = "https://www.youtube.com/watch?v=" + video_id
+    if not include_thumbnail:
+        return status, watch_url
+    thumbnail = info.get("thumbnail")
+    try:
+        parts = urllib.parse.urlsplit(thumbnail) if isinstance(thumbnail, str) else None
+    except ValueError:
+        parts = None
+    if not parts or parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+        thumbnail = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    return status, watch_url, thumbnail
 
 
 def read_events(signer):
@@ -421,7 +436,7 @@ def main():
                             home / ".local/state/nostr-stream-zap/state.json",
                             home / ".local/state/lightning-goats-stream/goals")
         watcher = Watcher(api, sync, args.file, lambda: nginx_publishing(args.stats_url),
-                          lambda: youtube_state(home), lambda: read_events(signer),
+                          lambda: youtube_state(home, include_thumbnail=True), lambda: read_events(signer),
                           signer.public_key, api.base_url,
                           youtube_by_url=lambda url: youtube_state(home, url))
         previous = None

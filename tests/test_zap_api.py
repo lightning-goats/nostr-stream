@@ -8,6 +8,8 @@ from pathlib import Path
 import threading
 import tempfile
 import unittest
+from unittest.mock import patch
+import subprocess
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "nostr-stream-zap"
@@ -210,6 +212,58 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(len(requests), 2)
             self.assertEqual(program.with_suffix(".calls").read_text(), "prepare\n")
 
+    def test_youtube_lookup_returns_thumbnail_without_an_extra_extraction(self):
+        zap = module(self)
+        info = {"status": "is_live", "id": "abcdefghijk",
+                "thumbnail": "https://i.ytimg.com/vi/abcdefghijk/maxresdefault_live.jpg"}
+        result = subprocess.CompletedProcess([], 0, json.dumps(info) + "\n", "")
+        with patch.object(zap.subprocess, "run", return_value=result) as run:
+            self.assertEqual(zap.youtube_state(Path("/home/test"), include_thumbnail=True),
+                             ("is_live", "https://www.youtube.com/watch?v=abcdefghijk", info["thumbnail"]))
+            self.assertEqual(run.call_count, 1)
+
+    def test_youtube_lookup_preserves_status_contract_and_handles_missing_thumbnail(self):
+        zap = module(self)
+        for thumbnail in [None, "NA", "http://example.com/image.jpg", "https://[invalid"]:
+            info = {"status": "was_live", "id": "abcdefghijk", "thumbnail": thumbnail}
+            result = subprocess.CompletedProcess([], 0, json.dumps(info) + "\n", "")
+            with patch.object(zap.subprocess, "run", return_value=result):
+                self.assertEqual(zap.youtube_state(Path("/home/test")),
+                                 ("was_live", "https://www.youtube.com/watch?v=abcdefghijk"))
+                self.assertEqual(zap.youtube_state(Path("/home/test"), include_thumbnail=True)[2],
+                                 "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg")
+
+    def test_youtube_thumbnail_updates_existing_live_event_without_duplicate_announcement(self):
+        zap = module(self)
+        requests = []
+        class Provider:
+            def request(self, method, path, data):
+                requests.append(data)
+                return {}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "metadata.json"
+            config.write_text('{"title":"Goats","image":"https://example.com/old-logo.png"}')
+            goals = root / "goals"
+            goals.mkdir()
+            (goals / "abcdefghijk").write_text("c" * 64)
+            program = root / "prepare"
+            program.write_text("#!/bin/sh\nprintf 'prepare\\n' >> \"$0.calls\"\n")
+            program.chmod(0o700)
+            sync = zap.Synchronizer(Provider(), program, root / "state.json", goals)
+            thumbnail = "https://i.ytimg.com/vi/abcdefghijk/maxresdefault_live.jpg"
+            watcher = zap.Watcher(sync.api, sync, config, lambda: True,
+                                  lambda: ("is_live", "https://www.youtube.com/watch?v=abcdefghijk", thumbnail),
+                                  lambda: [self.event()], HOST, SERVICE)
+            watcher.tick()
+            watcher.tick()
+            live_updates = [data for data in requests if data.get("id") == STREAM]
+            self.assertEqual(len(live_updates), 1)
+            self.assertEqual(live_updates[0]["image"], thumbnail)
+            self.assertEqual(live_updates[0]["goal"], "c" * 64)
+            self.assertEqual(sync.state["metadata"]["image"], thumbnail)
+            self.assertEqual(program.with_suffix(".calls").read_text(), "prepare\n")
+
     def test_watcher_waits_for_obs_without_creating_an_announcement(self):
         zap = module(self)
         self.assertTrue(hasattr(zap, "Watcher"), "nginx stream observer is missing")
@@ -285,7 +339,7 @@ class ApiTests(unittest.TestCase):
             sync = zap.Synchronizer(Provider(), program, state, goals)
             statuses = iter(["is_live", "was_live", "was_live", "was_live"])
             watcher = zap.Watcher(sync.api, sync, config, lambda: False,
-                                  lambda: (next(statuses), ""), lambda: [], HOST, SERVICE)
+                                  lambda: (next(statuses), "", ""), lambda: [], HOST, SERVICE)
             for _ in range(3):
                 watcher.tick()
                 self.assertTrue(state.exists())

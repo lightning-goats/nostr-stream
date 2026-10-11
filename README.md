@@ -84,7 +84,11 @@ Enable `nak-bunker.service` and `nostr-stream-zap.service`. Leave
 `youtube-nostr-watch.service` disabled in this mode to avoid another live event.
 The zap watcher observes nginx's actual publisher, waits for the current YouTube
 broadcast and zap.stream event, creates/reuses one goal and announcement, then
-updates that existing event's metadata and goal. It refreshes metadata every 20
+updates that existing event's metadata and goal. Its image uses the current
+YouTube broadcast thumbnail returned by the existing yt-dlp status lookup,
+overriding the configured image for the live event. This also supplies the image
+tag on zap.stream's Nostr live event. If the thumbnail field is missing, it uses
+YouTube's `hqdefault.jpg` URL for that same video. It refreshes metadata every 20
 minutes and retires the goal after three consecutive confirmed YouTube offline
 checks. Older broadcasts remain tracked across restarts until their individual
 YouTube URLs are confirmed ended; transient failures reset confirmation counts.
