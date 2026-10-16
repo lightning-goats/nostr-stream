@@ -28,6 +28,20 @@ def module(case):
 
 
 class ApiTests(unittest.TestCase):
+    def test_event_discovery_keeps_successful_relay_results_when_another_times_out(self):
+        zap = module(self)
+        class Signer:
+            nak = Path("/test/nak")
+            public_key = HOST
+        event = self.event()
+        def read(command, **kwargs):
+            if command[-1] == "wss://working.example":
+                return subprocess.CompletedProcess(command, 0, json.dumps(event) + "\n", "")
+            raise subprocess.TimeoutExpired(command, 8)
+        with patch.object(zap, "RELAYS", ("wss://working.example", "wss://unavailable.example")), \
+                patch.object(zap.subprocess, "run", side_effect=read):
+            self.assertEqual(zap.read_events(Signer()), [event])
+
     def test_patch_authentication_covers_the_exact_http_body(self):
         zap = module(self)
         captured = []
@@ -315,6 +329,86 @@ class ApiTests(unittest.TestCase):
             watcher.tick()
             self.assertEqual(requests[-1]["id"], STREAM)
             self.assertEqual(requests[-1]["goal"], "c" * 64)
+
+    def test_missing_provider_event_does_not_block_timed_announcement_retry(self):
+        zap = module(self)
+        class Provider:
+            def request(self, *args):
+                return {}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "metadata.json"
+            config.write_text('{"title":"Goats"}')
+            goals = root / "goals"
+            goals.mkdir()
+            (goals / "abcdefghijk").write_text("c" * 64)
+            program = root / "prepare"
+            program.write_text('''#!/bin/sh
+printf 'attempt\\n' >> "$0.calls"
+if [ ! -f "$0.recovered" ]; then exit 1; fi
+touch "$0.published"
+''')
+            program.chmod(0o700)
+            sync = zap.Synchronizer(Provider(), program, root / "state.json", goals)
+            now = [0]
+            watcher = zap.Watcher(sync.api, sync, config, lambda: True,
+                                  lambda: ("is_live", "https://www.youtube.com/watch?v=abcdefghijk"),
+                                  lambda: [], HOST, SERVICE, clock=lambda: now[0])
+            with self.assertRaises(zap.ZapError):
+                watcher.tick()
+            self.assertEqual(program.with_suffix(".calls").read_text(), "attempt\n")
+            now[0] = 29
+            watcher.tick()
+            self.assertEqual(program.with_suffix(".calls").read_text(), "attempt\n")
+            program.with_suffix(".recovered").touch()
+            now[0] = 30
+            watcher.tick()
+            self.assertTrue(program.with_suffix(".published").exists())
+            self.assertEqual(program.with_suffix(".calls").read_text(), "attempt\nattempt\n")
+            now[0] = 60
+            watcher.tick()
+            self.assertEqual(program.with_suffix(".calls").read_text(), "attempt\nattempt\n")
+
+    def test_provider_api_outage_does_not_block_stream_announcement(self):
+        zap = module(self)
+        class Provider:
+            def request(self, *args):
+                raise zap.ZapError("provider API unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "metadata.json"
+            config.write_text('{"title":"Goats"}')
+            goals = root / "goals"
+            goals.mkdir()
+            (goals / "abcdefghijk").write_text("c" * 64)
+            program = root / "prepare"
+            program.write_text('#!/bin/sh\ntouch "$0.published"\n')
+            program.chmod(0o700)
+            sync = zap.Synchronizer(Provider(), program, root / "state.json", goals)
+            watcher = zap.Watcher(sync.api, sync, config, lambda: True,
+                                  lambda: ("is_live", "https://www.youtube.com/watch?v=abcdefghijk"),
+                                  lambda: [], HOST, SERVICE)
+            with self.assertRaises(zap.ZapError):
+                watcher.tick()
+            self.assertTrue(program.with_suffix(".published").exists())
+
+    def test_goal_retirement_allows_preparing_the_same_broadcast_again(self):
+        zap = module(self)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            goals = root / "goals"
+            goals.mkdir()
+            (goals / "abcdefghijk").write_text("c" * 64)
+            program = root / "prepare"
+            program.write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> "$0.calls"\n')
+            program.chmod(0o700)
+            sync = zap.Synchronizer(None, program, root / "state.json", goals)
+            url = "https://www.youtube.com/watch?v=abcdefghijk"
+            sync.prepare(url)
+            sync.delete_goal(url)
+            sync.prepare(url)
+            self.assertEqual(program.with_suffix(".calls").read_text().splitlines(),
+                             ["prepare", "delete-goal", "prepare"])
 
     def test_goal_retirement_waits_for_confirmed_youtube_end(self):
         zap = module(self)

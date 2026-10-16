@@ -35,22 +35,33 @@ GOAL_AMOUNT_MSAT="10000000"
 GOAL_AMOUNT_SATS="10000"
 GOAL_CONTENT="Feed the Lightning Goats — help trigger 10 feedings today!"
 GOAL_SUMMARY="10,000 sats funds up to 10 Lightning-powered goat feedings at 1,000 sats each."
-GOAL_RELAY_HINT="wss://nos.lol/"
+GOAL_RELAY_HINT="wss://relay.primal.net/"
 
 # Try these individually for NIP-46 RPC.
 BUNKER_RELAYS=(
+    "relay.primal.net"
+    "relay.nostr.net"
+    "nostr.oxtr.dev"
+    "nostr.chaima.info"
     "nos.lol"
     "relay.damus.io"
 )
 
 # Relays used for NIP-53 live-event, NIP-75 goal, and deletion publication.
 PUBLISH_RELAYS=(
+    "relay.primal.net"
+    "relay.nostr.net"
+    "nostr.oxtr.dev"
+    "nostr.chaima.info"
     "nos.lol"
     "relay.damus.io"
 )
 
 # Relays used for the once-per-YouTube-stream kind-1 announcement note.
 ANNOUNCEMENT_RELAYS=(
+    "relay.primal.net"
+    "relay.nostr.net"
+    "nostr.oxtr.dev"
     "lnb.bolverker.com/nostrrelay/666"
     "nos.lol"
     "nostr.chaima.info"
@@ -70,6 +81,7 @@ check_config() {
     [[ -n "$SYSTEMD_CREDS" ]] || die "systemd-creds not found in PATH"
     [[ -n "$CURL" ]] || die "curl not found in PATH"
     command -v timeout >/dev/null 2>&1 || die "timeout not found in PATH"
+    command -v flock >/dev/null 2>&1 || die "flock not found in PATH"
 
     [[ -s "$BUNKER_PUB_FILE" ]] || die "missing $BUNKER_PUB_FILE"
     [[ -s "$CLIENT_CRED" ]] || die "missing $CLIENT_CRED"
@@ -160,13 +172,23 @@ resolve_cover_image() {
 
 publish_with_relays() {
     local relay_group="$1"
-    shift
+    local cache_key="$2"
+    shift 2
 
     local -a target_relays
     local relay
     local bunker
     local rc
     local output
+    local signed=""
+    local event_id=""
+    local directory
+    local index=0
+    local accepted=false
+    local -a jobs=()
+    local job
+    local cache=""
+    local temporary
 
     case "$relay_group" in
         stream)
@@ -184,7 +206,16 @@ publish_with_relays() {
     export NOSTR_CLIENT_KEY
     LAST_EVENT_ID=""
 
+    if [[ -n "$cache_key" ]]; then
+        cache="$STATE_DIR/outbox/$cache_key.json"
+        if [[ -s "$cache" ]]; then
+            signed="$(cat "$cache")"
+            event_id="$(printf '%s\n' "$signed" | sed -nE 's/.*"id":"([0-9a-f]{64})".*/\1/p')"
+            [[ "$event_id" =~ ^[0-9a-f]{64}$ ]] || die "saved publication is invalid; refusing to duplicate it"
+        fi
+    fi
     for relay in "${BUNKER_RELAYS[@]}"; do
+        [[ -z "$signed" ]] || break
         bunker="$(bunker_uri "$relay")"
 
         echo "NIP-46 signer via wss://$relay ..."
@@ -194,11 +225,10 @@ publish_with_relays() {
             timeout \
                 --signal=TERM \
                 --kill-after=2s \
-                15s \
+                8s \
                 "$NAK" --connect-timeout 5s event --github \
                     --sec "$bunker" \
                     "$@" \
-                    "${target_relays[@]}" \
                 2>&1
         )"
         rc=$?
@@ -207,13 +237,13 @@ publish_with_relays() {
         [[ -z "$output" ]] || printf '%s\n' "$output"
 
         if [[ $rc -eq 0 ]]; then
-            LAST_EVENT_ID="$(
-                printf '%s\n' "$output" |
+            signed="$(printf '%s\n' "$output" | sed -nE '/^\{.*"id":"[0-9a-f]{64}".*\}$/p' | head -n1)"
+            event_id="$(
+                printf '%s\n' "$signed" |
                     sed -nE 's/.*"id":"([0-9a-f]{64})".*/\1/p' |
                     head -n1
             )"
-            unset NOSTR_CLIENT_KEY
-            return 0
+            [[ "$event_id" =~ ^[0-9a-f]{64}$ ]] && break
         fi
 
         if [[ $rc -eq 124 || $rc -eq 137 ]]; then
@@ -224,15 +254,56 @@ publish_with_relays() {
     done
 
     unset NOSTR_CLIENT_KEY
+    [[ -n "$signed" && "$event_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+
+    if [[ -n "$cache" && ! -s "$cache" ]]; then
+        mkdir -p "$STATE_DIR/outbox" || return 1
+        temporary="$(mktemp "$STATE_DIR/outbox/.pending.XXXXXX")" || return 1
+        if ! printf '%s\n' "$signed" > "$temporary" ||
+                ! sync -f "$temporary" || ! mv -f -- "$temporary" "$cache"; then
+            rm -f -- "$temporary"
+            return 1
+        fi
+    fi
+    if [[ -n "$cache" ]]; then
+        sync -f "$cache" && sync -f "$STATE_DIR/outbox" || return 1
+    fi
+
+    # Sign once, then publish the identical event independently to each relay.
+    # A slow relay must not cancel another relay's acknowledged publication.
+    directory="$(mktemp -d "$STATE_DIR/.publish.XXXXXX")" || return 1
+    for relay in "${target_relays[@]}"; do
+        (
+            if printf '%s\n' "$signed" | timeout --signal=TERM --kill-after=2s 12s \
+                    "$NAK" --connect-timeout 3s event "$relay" \
+                    > "$directory/$index.log" 2>&1; then
+                touch "$directory/$index.ok"
+            fi
+        ) &
+        jobs+=("$!")
+        index=$((index + 1))
+    done
+    for job in "${jobs[@]}"; do
+        wait "$job" || true
+    done
+    for ((index = 0; index < ${#target_relays[@]}; index++)); do
+        if [[ -e "$directory/$index.ok" ]]; then
+            accepted=true
+            echo "Publication acknowledged by ${target_relays[$index]}"
+        else
+            echo "Publication failed via ${target_relays[$index]}; other relays remain independent." >&2
+        fi
+    done
+    rm -rf -- "$directory"
+    if [[ "$accepted" == true ]]; then
+        LAST_EVENT_ID="$event_id"
+        return 0
+    fi
     return 1
 }
 
 publish_stream_event() {
-    publish_with_relays stream "$@"
-}
-
-publish_announcement_event() {
-    publish_with_relays announcement "$@"
+    publish_with_relays stream "" "$@"
 }
 
 ensure_goal() {
@@ -272,11 +343,11 @@ ensure_goal() {
     echo "  video: $short_url"
     echo "  target: $GOAL_AMOUNT_SATS sats"
 
-    if ! publish_stream_event \
+    if ! publish_with_relays stream "goal-$video_id" \
         -k 9041 \
         -c "$GOAL_CONTENT" \
         -t "amount=$GOAL_AMOUNT_MSAT" \
-        -t 'relays=wss://nos.lol/;wss://relay.damus.io/' \
+        -t 'relays=wss://relay.primal.net/;wss://relay.nostr.net/;wss://nostr.oxtr.dev/;wss://nos.lol/;wss://relay.damus.io/' \
         -t "summary=$GOAL_SUMMARY" \
         -t "image=$image" \
         -t "r=$short_url" \
@@ -323,6 +394,7 @@ delete_goal() {
     fi
 
     rm -f "$marker"
+    rm -f "$STATE_DIR/outbox/goal-$video_id.json"
     echo "Zap-goal deletion request published"
 }
 
@@ -430,7 +502,7 @@ announce_stream() {
     echo "  $ANNOUNCEMENT_HASHTAG"
     [[ -z "$goal_id" ]] || echo "  goal: $goal_id"
 
-    if ! publish_announcement_event \
+    if ! publish_with_relays announcement "note-$video_id" \
         -k 1 \
         -c "$content" \
         -t 'r=wss://lnb.bolverker.com/nostrrelay/666' \
@@ -711,6 +783,13 @@ status_stream() {
 }
 
 check_config
+
+case "${1:-}" in
+    prepare|start|stop|refresh|refresh-if-due|announce|delete-goal)
+        exec 9> "$STATE_DIR/.publication.lock"
+        flock -w 5 9 || die "another publication is in progress; retry shortly"
+        ;;
+esac
 
 case "${1:-}" in
     prepare)

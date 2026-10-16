@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -20,7 +21,8 @@ import xml.etree.ElementTree as ET
 
 
 API_URL = "https://api-core.zap.stream/api/v1"
-RELAYS = ("wss://nos.lol", "wss://relay.damus.io")
+RELAYS = ("wss://relay.primal.net", "wss://relay.nostr.net", "wss://nostr.oxtr.dev",
+          "wss://nostr.chaima.info", "wss://nos.lol", "wss://relay.damus.io")
 METADATA_FIELDS = {"title", "summary", "image", "tags", "content_warning", "goal"}
 
 
@@ -96,14 +98,14 @@ class RemoteSigner:
                 command += ["-t", f"{name}={value}"]
             try:
                 result = subprocess.run(command, input="", capture_output=True,
-                                        text=True, env=self.environment, timeout=35)
+                                        text=True, env=self.environment, timeout=10)
                 event = json.loads(result.stdout) if result.returncode == 0 else {}
             except (subprocess.TimeoutExpired, json.JSONDecodeError):
                 continue
             if (event.get("pubkey") == self.public_key and event.get("kind") == 27235
                     and event.get("tags") == tags and event.get("content") == ""):
                 return event
-        raise ZapError("Bunker signing failed on both relays; private diagnostics suppressed.")
+        raise ZapError("Bunker signing failed on all configured relays; private diagnostics suppressed.")
 
 
 class ZapApi:
@@ -192,6 +194,7 @@ class Synchronizer:
         self.program = program
         self.state_file = state_file
         self.goals_directory = goals_directory
+        self.prepared_url = None
         try:
             self.state = json.loads(state_file.read_text())
         except (FileNotFoundError, json.JSONDecodeError):
@@ -208,10 +211,7 @@ class Synchronizer:
         if same and time.time() - self.state.get("updated_at", 0) < 1200:
             return False
         if not same or not (self.goals_directory / video_id).is_file():
-            result = subprocess.run([str(self.program), "prepare", youtube_url],
-                                    capture_output=True, timeout=110)
-            if result.returncode:
-                raise ZapError("Preparing the zap goal or announcement failed; will retry.")
+            self.prepare(youtube_url)
         goal = (self.goals_directory / video_id).read_text().strip()
         if not re.fullmatch(r"[0-9a-f]{64}", goal):
             raise ZapError("The prepared zap goal has an invalid event ID.")
@@ -225,6 +225,19 @@ class Synchronizer:
                          updated_at=time.time(), pending_goals=pending)
         self.save_state(new_state)
         return True
+
+    def prepare(self, youtube_url):
+        if self.prepared_url == youtube_url:
+            return
+        parsed = urllib.parse.urlsplit(youtube_url)
+        video_id = urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
+        if parsed.hostname != "www.youtube.com" or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+            raise ZapError("Expected a current YouTube watch URL.")
+        result = subprocess.run([str(self.program), "prepare", youtube_url],
+                                capture_output=True, timeout=150)
+        if result.returncode:
+            raise ZapError("Preparing the zap goal or announcement failed; will retry in 30 seconds.")
+        self.prepared_url = youtube_url
 
     def save_state(self, new_state):
         if not new_state:
@@ -254,6 +267,8 @@ class Synchronizer:
                                         capture_output=True, timeout=80)
                 if result.returncode:
                     raise ZapError("Could not retire the ended stream's goal; will retry.")
+            if self.prepared_url == url:
+                self.prepared_url = None
 
     def retire_goal(self):
         self.delete_goal(self.state.get("url"))
@@ -269,7 +284,7 @@ class Synchronizer:
 
 class Watcher:
     def __init__(self, api, sync, metadata_file, publishing, youtube, events, host, service,
-                 youtube_by_url=None):
+                 youtube_by_url=None, clock=time.monotonic):
         self.api = api
         self.sync = sync
         self.metadata_file = metadata_file
@@ -282,6 +297,9 @@ class Watcher:
         self.offline_checks = 0
         self.youtube_by_url = youtube_by_url
         self.pending_checks = {}
+        self.clock = clock
+        self.prepare_url = None
+        self.next_prepare_at = 0
 
     def tick(self):
         try:
@@ -310,9 +328,13 @@ class Watcher:
     def tick_checked(self):
         metadata = validate_metadata(json.loads(self.metadata_file.read_text()))
         defaults = dict(metadata, goal="")
+        defaults_error = None
         if self.defaults != defaults:
-            self.api.request("PATCH", "event", defaults)
-            self.defaults = defaults
+            try:
+                self.api.request("PATCH", "event", defaults)
+                self.defaults = defaults
+            except (ZapError, OSError, ValueError, subprocess.SubprocessError) as error:
+                defaults_error = error
         self.poll_pending()
         if not self.publishing():
             if self.sync.state.get("url"):
@@ -323,14 +345,30 @@ class Watcher:
                         self.sync.retire_goal()
                 else:
                     self.offline_checks = 0
+            if defaults_error:
+                raise defaults_error
             return "Waiting for OBS to publish to local nginx."
         self.offline_checks = 0
-        event = find_live_event(self.events(), self.host, self.service)
-        if not event:
-            return "OBS is streaming; waiting for zap.stream's live event."
         status, url, *thumbnail = self.youtube()
         if status != "is_live":
+            if defaults_error:
+                raise defaults_error
             return "OBS is streaming; waiting for YouTube's live broadcast."
+        if self.prepare_url != url:
+            self.prepare_url = url
+            self.next_prepare_at = 0
+        if self.sync.prepared_url != url:
+            if self.clock() < self.next_prepare_at:
+                return "OBS is streaming; Nostr publication pending, retry scheduled."
+            try:
+                self.sync.prepare(url)
+            finally:
+                self.next_prepare_at = self.clock() + 30
+        if defaults_error:
+            raise defaults_error
+        event = find_live_event(self.events(), self.host, self.service)
+        if not event:
+            return "OBS is streaming; announcement prepared, waiting for zap.stream's live event."
         if thumbnail and thumbnail[0]:
             metadata["image"] = thumbnail[0]
         self.sync.sync(url, event, metadata)
@@ -371,17 +409,27 @@ def youtube_state(home, url="https://www.youtube.com/@lightning-goats/live", *, 
 
 def read_events(signer):
     query = {"kinds": [30311], "#p": [signer.public_key], "since": int(time.time()) - 3600, "limit": 30}
-    result = subprocess.run(
-        [str(signer.nak), "--connect-timeout", "5s", "req", *RELAYS],
-        input=json.dumps(query) + "\n", capture_output=True, text=True, timeout=20)
-    if result.returncode:
+    def read_relay(relay):
+        try:
+            result = subprocess.run(
+                [str(signer.nak), "--connect-timeout", "3s", "req", relay],
+                input=json.dumps(query) + "\n", capture_output=True, text=True, timeout=8)
+            return result.stdout if result.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            return None
+    with ThreadPoolExecutor(max_workers=len(RELAYS)) as pool:
+        responses = list(pool.map(read_relay, RELAYS))
+    if all(response is None for response in responses):
         raise ZapError("Could not read zap.stream's live events from the relays.")
     events = []
-    for line in result.stdout.splitlines():
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            pass
+    for response in responses:
+        for line in (response or "").splitlines():
+            try:
+                event = json.loads(line)
+                if isinstance(event, dict) and event not in events:
+                    events.append(event)
+            except json.JSONDecodeError:
+                pass
     return events
 
 

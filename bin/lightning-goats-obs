@@ -76,18 +76,59 @@ def obs_arguments(hold):
     return arguments
 
 
+def prepare_remote(home):
+    """Refresh optional remote state without discarding working local routes."""
+    commands = [
+        ("nginx destination refresh", ["sync-ingest"], 100),
+        ("zap.stream metadata initialization", ["metadata", "--file",
+         str(home / ".config/nostr-stream/zap-metadata.json")], 90),
+    ]
+    ready = True
+    for label, arguments, timeout in commands:
+        try:
+            result = subprocess.run(
+                [str(home / ".local/bin/nostr-stream"), "zap", *arguments],
+                capture_output=True, timeout=timeout)
+            succeeded = result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            succeeded = False
+        if not succeeded:
+            ready = False
+            print(f"lightning-goats-obs: {label} failed; continuing with saved routes. "
+                  "Private command diagnostics suppressed.", file=sys.stderr, flush=True)
+    return ready
+
+
+def start_remote_preparation(home):
+    directory = home / ".local/state/nostr-stream-zap"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(directory / "obs-preparation.log",
+                         os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(descriptor, "ab") as output:
+        os.fchmod(output.fileno(), 0o600)
+        output.write((datetime.datetime.now().isoformat() + " Remote preparation started\n").encode())
+        output.flush()
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--prepare"],
+                         stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                         start_new_session=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="Verify readiness without launching OBS")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="Verify readiness without launching OBS")
+    mode.add_argument("--prepare", action="store_true", help="Refresh remote routing and metadata without launching OBS")
     args = parser.parse_args()
     home = Path.home()
+    if args.prepare:
+        return 0 if prepare_remote(home) else 1
     profile = home / "snap/obs-studio/common/.config/obs-studio/basic/profiles/Untitled/service.json"
     hold = (home / ".config/nostr-stream/hold-stream").exists()
     if hold:
         if args.check:
             print("Streaming is held for preview verification.")
             return
-        os.execve("/snap/bin/obs-studio", obs_arguments(True), obs_environment(os.environ))
+        return os.execve("/snap/bin/obs-studio", obs_arguments(True), obs_environment(os.environ))
     capture_youtube_profile(profile, home / ".config/nostr-stream/youtube-service.json")
     deadline = time.monotonic() + 20
     while True:
@@ -98,27 +139,23 @@ def main():
             if time.monotonic() >= deadline:
                 raise RuntimeError("nginx is not listening on localhost:1935; OBS was not launched.")
             time.sleep(1)
-    # Metadata is initialized before zap.stream creates the new live event.
-    result = subprocess.run(
-        [str(home / ".local/bin/nostr-stream"), "zap", "sync-ingest"],
-        capture_output=True, timeout=100)
-    if result.returncode:
-        raise RuntimeError("Refreshing nginx's ingest destinations failed; OBS was not launched.")
-    result = subprocess.run(
-        [str(home / ".local/bin/nostr-stream"), "zap", "metadata", "--file",
-         str(home / ".config/nostr-stream/zap-metadata.json")], capture_output=True, timeout=90)
-    if result.returncode:
-        raise RuntimeError("zap.stream metadata initialization failed; OBS was not launched.")
     configure_profile(profile, home / ".local/state/obs-config-backups/launcher")
     if args.check:
+        if not prepare_remote(home):
+            return 1
         print("nginx routing and zap.stream metadata are ready; OBS was not launched.")
-        return
+        return 0
+    try:
+        start_remote_preparation(home)
+    except (OSError, subprocess.SubprocessError):
+        print("lightning-goats-obs: Background preparation could not start; "
+              "continuing with saved routes.", file=sys.stderr)
     os.execve("/snap/bin/obs-studio", obs_arguments(False), obs_environment(os.environ))
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         message = str(error) if isinstance(error, RuntimeError) else type(error).__name__
         print(f"lightning-goats-obs: {message}", file=sys.stderr)

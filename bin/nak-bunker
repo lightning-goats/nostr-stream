@@ -33,6 +33,9 @@ export NOSTR_SECRET_KEY="$(cat "$CREDENTIALS_DIRECTORY/nostr-key")"
 
 exec "$NAK" -q bunker \
     -k "$CLIENT_PUB" \
-    relay.nsec.app \
+    relay.primal.net \
+    relay.nostr.net \
+    nostr.oxtr.dev \
+    nostr.chaima.info \
     nos.lol \
     relay.damus.io

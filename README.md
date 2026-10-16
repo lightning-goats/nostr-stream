@@ -96,15 +96,41 @@ zap.stream owns live/ended status and the playback URL. The watcher accepts
 its UK regional service address and chooses HTTPS playback when events also
 advertise another transport.
 
-The zap installer wires desktop and login launchers to `lightning-goats-obs`. It refreshes ingest
-destinations, initializes metadata, restores OBS's local nginx destination, and
-launches OBS with streaming enabled. Existing OBS service settings are backed
+The zap installer wires desktop and login launchers to `lightning-goats-obs`.
+It restores OBS's local nginx destination and immediately launches OBS with
+streaming enabled through nginx's saved destinations. Ingest refresh and
+metadata initialization run in a detached worker; relay or API failures cannot
+block OBS or the existing YouTube and zap.stream routes. Failures are recorded
+without private command output in
+`~/.local/state/nostr-stream-zap/obs-preparation.log` (mode 600).
+`lightning-goats-obs --check` still performs preparation synchronously and
+returns a nonzero status if remote preparation is incomplete.
+Existing OBS service settings are backed
 up privately before replacement. Close and reopen an already-running OBS
 instance to load the new service settings. The launcher selects the uniquely
 named `Lightning Goats` scene collection and the `Untitled` profile. Preserve
 the camera and overlay in that collection. To open a stopped preview during
 repairs, create `~/.config/nostr-stream/hold-stream`; remove it after verifying
 the picture to restore automatic streaming on startup.
+
+The signer and publisher use `relay.primal.net`, `relay.nostr.net`,
+`nostr.oxtr.dev`, and `nostr.chaima.info`, with `nos.lol` and
+`relay.damus.io` retained as additional fallbacks. Publication signs an event
+once and sends that same event independently to the destination relays with
+bounded timeouts. One acknowledgement is sufficient for success. Goals and
+announcement notes retain their signed payloads privately by broadcast ID in
+`~/.local/state/lightning-goats-stream/outbox`, so a lost acknowledgement or a
+crash before writing the success marker does not create a different event on
+retry. Publication commands serialize changes to the local markers.
+
+While nginx and YouTube are live, the zap watcher attempts the goal and
+announcement independently of zap.stream API availability or discovery of its
+live event. Failed publication remains pending and is retried after 30 seconds
+on the watcher's next poll. Successful preparation is reused, including across
+restarts through the persisted broadcast markers. Provider event discovery
+queries relays independently, preserving successful results when another relay
+times out. zap.stream continues to own its NIP-53 live/ended event; the watcher
+does not create a second live event.
 
 Run regression tests with `python3 -m unittest discover -s tests -v`. The tests
 use generated, disposable identities and local HTTP fixtures; they do not
