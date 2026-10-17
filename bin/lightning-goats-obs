@@ -68,11 +68,13 @@ def obs_environment(desktop):
     return environment
 
 
-def obs_arguments(hold):
+def obs_arguments(hold, recover=False):
     arguments = ["/snap/bin/obs-studio", "--profile", "Untitled",
                  "--collection", "Lightning Goats"]
     if not hold:
         arguments.append("--startstreaming")
+    if recover:
+        arguments.append("--disable-shutdown-check")
     return arguments
 
 
@@ -118,6 +120,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="Verify readiness without launching OBS")
     mode.add_argument("--prepare", action="store_true", help="Refresh remote routing and metadata without launching OBS")
+    mode.add_argument("--recover", action="store_true", help="Resume after a crash without the shutdown prompt")
     args = parser.parse_args()
     home = Path.home()
     if args.prepare:
@@ -128,7 +131,7 @@ def main():
         if args.check:
             print("Streaming is held for preview verification.")
             return
-        return os.execve("/snap/bin/obs-studio", obs_arguments(True), obs_environment(os.environ))
+        return os.execve("/snap/bin/obs-studio", obs_arguments(True, args.recover), obs_environment(os.environ))
     capture_youtube_profile(profile, home / ".config/nostr-stream/youtube-service.json")
     deadline = time.monotonic() + 20
     while True:
@@ -150,7 +153,7 @@ def main():
     except (OSError, subprocess.SubprocessError):
         print("lightning-goats-obs: Background preparation could not start; "
               "continuing with saved routes.", file=sys.stderr)
-    os.execve("/snap/bin/obs-studio", obs_arguments(False), obs_environment(os.environ))
+    os.execve("/snap/bin/obs-studio", obs_arguments(False, args.recover), obs_environment(os.environ))
 
 
 if __name__ == "__main__":

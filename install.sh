@@ -25,6 +25,10 @@ need curl
 need timeout
 if [[ "$MODE" == --zap ]]; then
     need python3
+    python3 -c 'import websockets.sync.client; assert int(websockets.__version__.split(".")[0]) >= 15' || {
+        echo "install: install python3-websockets (version 15 or newer) for OBS recovery." >&2
+        exit 1
+    }
 fi
 
 mkdir -p \
@@ -44,6 +48,8 @@ install -m 0755 "$ROOT/bin/nostr-stream" \
 if [[ "$MODE" == --zap ]]; then
     install -m 0755 "$ROOT/bin/nostr-stream-zap" "$HOME/.local/libexec/nostr-stream-zap"
     install -m 0755 "$ROOT/bin/lightning-goats-obs" "$HOME/.local/bin/lightning-goats-obs"
+    install -m 0755 "$ROOT/bin/lightning-goats-obs-watch" "$HOME/.local/libexec/lightning-goats-obs-watch"
+    install -m 0644 "$ROOT/systemd/lightning-goats-obs-watch.service" "$HOME/.config/systemd/user/lightning-goats-obs-watch.service"
     install -m 0755 "$ROOT/bin/provision-nostr-client" "$HOME/.local/bin/provision-nostr-client"
     install -m 0644 "$ROOT/systemd/nostr-stream-zap.service" "$HOME/.config/systemd/user/nostr-stream-zap.service"
     mkdir -p "$HOME/.config/nostr-stream" "$HOME/.local/state/nostr-stream-zap" \
@@ -98,6 +104,7 @@ if [[ "$MODE" == --zap ]]; then
     echo "Keep the YouTube destination profile in ~/.config/nostr-stream/youtube-service.json (mode 600)."
     echo "Install bin/lightning-goats-nginx-routes under /usr/local/libexec as root."
     echo "Enable nak-bunker.service and nostr-stream-zap.service; leave youtube-nostr-watch.service disabled."
+    echo "Enable lightning-goats-obs-watch.service for crash recovery during graphical sessions."
     echo "Check readiness with: lightning-goats-obs --check"
     exit 0
 fi

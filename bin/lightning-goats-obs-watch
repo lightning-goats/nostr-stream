@@ -1,0 +1,199 @@
+#!/usr/bin/python3
+"""Resume an observed live stream after OBS disappears unexpectedly."""
+
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import time
+import uuid
+
+from websockets.sync.client import connect
+from websockets.exceptions import WebSocketException
+
+
+class Recovery:
+    def __init__(self):
+        self.wanted = False
+        self.exiting = False
+        self.stopped = False
+        self.retry_at = 0
+
+    def status(self, active, now):
+        if not self.exiting and not self.stopped and (active or now >= self.retry_at):
+            self.wanted = active
+
+    def event(self, data):
+        if data['eventType'] == 'ExitStarted':
+            self.exiting = True
+            self.wanted = False
+        elif data['eventType'] == 'StreamStateChanged':
+            output = data['eventData']
+            if output['outputState'] in {'OBS_WEBSOCKET_OUTPUT_STOPPING',
+                                          'OBS_WEBSOCKET_OUTPUT_STOPPED'}:
+                self.wanted = False
+                self.stopped = True
+            elif output['outputState'] in {'OBS_WEBSOCKET_OUTPUT_STARTING',
+                                            'OBS_WEBSOCKET_OUTPUT_STARTED'} and not self.exiting:
+                self.stopped = False
+                if output['outputActive']:
+                    self.wanted = True
+            elif output['outputActive'] and not self.exiting and not self.stopped:
+                self.wanted = True
+
+    def should_launch(self, process_present, held, now):
+        if held:
+            self.wanted = False
+        return (not process_present and self.wanted and not self.exiting
+                and not self.stopped and now >= self.retry_at)
+
+    def attempted(self, now):
+        self.retry_at = now + 30
+
+
+def obs_processes(root=Path('/proc')):
+    processes = set()
+    for entry in root.iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid() or (entry / 'comm').read_text().strip() != 'obs':
+                continue
+            fields = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
+            if fields[0] not in {'Z', 'X'}:
+                processes.add((int(entry.name), int(fields[19])))
+        except (OSError, ValueError, IndexError):
+            continue
+    return processes
+
+
+def launch(home):
+    directory = home / '.local/state/obs-recovery'
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(directory / 'launch.log', os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(descriptor, 'ab') as output:
+        os.fchmod(output.fileno(), 0o600)
+        command = ['systemd-run', '--user', '--collect', '--unit=lightning-goats-obs-recovery',
+                   '--property=Type=exec', '--property=UMask=0077',
+                   '--property=StandardOutput=append:' + str(directory / 'launch.log'),
+                   '--property=StandardError=append:' + str(directory / 'launch.log'),
+                   '--', str(home / '.local/bin/lightning-goats-obs'), '--recover']
+        return subprocess.Popen(command,
+                                stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                                start_new_session=True)
+
+
+def connect_obs(home):
+    config = json.loads((home / 'snap/obs-studio/common/.config/obs-studio/plugin_config/'
+                        'obs-websocket/config.json').read_text())
+    port = int(config.get('server_port', 4455))
+    ws = connect(f'ws://127.0.0.1:{port}', open_timeout=3, close_timeout=1, proxy=None)
+    try:
+        hello = json.loads(ws.recv(timeout=3))
+        if hello['op'] != 0:
+            raise ValueError('Expected OBS Hello')
+        identify = {'rpcVersion': 1, 'eventSubscriptions': 65}
+        if 'authentication' in hello['d']:
+            auth = hello['d']['authentication']
+            secret = base64.b64encode(hashlib.sha256(
+                (config['server_password'] + auth['salt']).encode()).digest()).decode()
+            identify['authentication'] = base64.b64encode(hashlib.sha256(
+                (secret + auth['challenge']).encode()).digest()).decode()
+        ws.send(json.dumps({'op': 1, 'd': identify}))
+        if json.loads(ws.recv(timeout=3))['op'] != 2:
+            raise ValueError('OBS identification failed')
+        return ws
+    except Exception:
+        ws.close()
+        raise
+
+
+def watch(home):
+    state = Recovery()
+    tracked = None
+    ws = None
+    child = None
+    next_query = 0
+    event_revision = 0
+    query_revision = 0
+    request_id = None
+
+    def receive(message):
+        nonlocal event_revision
+        if message['op'] == 5:
+            state.event(message['d'])
+            event_revision += 1
+        elif (message['op'] == 7 and message['d']['requestId'] == request_id
+              and message['d']['requestStatus']['result']
+              and query_revision == event_revision):
+            active = message['d']['responseData']['outputActive']
+            previously = state.wanted
+            state.status(active, time.monotonic())
+            if state.wanted and not previously:
+                print('Live stream observed; crash recovery armed.', flush=True)
+
+    while True:
+        now = time.monotonic()
+        processes = obs_processes()
+        # Ambiguous multiple-instance setups are observed without launching another.
+        observed = next(iter(processes)) if len(processes) == 1 else None
+        if tracked != observed:
+            if ws:
+                # Process exit can race with its final queued ExitStarted event.
+                # Drain the old connection before deciding whether it crashed.
+                if tracked not in processes:
+                    try:
+                        deadline = time.monotonic() + 2
+                        while time.monotonic() < deadline:
+                            receive(json.loads(ws.recv(timeout=max(0.01, deadline - time.monotonic()))))
+                    except (OSError, ValueError, KeyError, TypeError, WebSocketException, TimeoutError):
+                        pass
+                ws.close()
+                ws = None
+            if len(processes) > 1:
+                state.wanted = False
+            tracked = observed
+            if observed:
+                state.exiting = False
+                state.stopped = False
+                state.status(False, now)
+        held = (home / '.config/nostr-stream/hold-stream').exists()
+        child_running = child is not None and child.poll() is None
+        if state.should_launch(bool(processes) or child_running, held, now):
+            state.attempted(now)
+            print('OBS disappeared during streaming; recovering through saved routes.', flush=True)
+            try:
+                child = launch(home)
+            except OSError:
+                print('OBS recovery launch failed; retrying in 30 seconds.', flush=True)
+        if observed is None:
+            time.sleep(2)
+            continue
+        try:
+            if ws is None:
+                ws = connect_obs(home)
+                next_query = 0
+                print(f'Observing OBS PID {observed[0]}.', flush=True)
+            if now >= next_query:
+                query_revision = event_revision
+                request_id = str(uuid.uuid4())
+                ws.send(json.dumps({'op': 6, 'd': {'requestType': 'GetStreamStatus',
+                                                  'requestId': request_id}}))
+                next_query = now + 10
+            try:
+                message = json.loads(ws.recv(timeout=2))
+            except TimeoutError:
+                continue
+            receive(message)
+        except (OSError, ValueError, KeyError, TypeError, WebSocketException, TimeoutError):
+            # An unavailable websocket alone never authorizes a restart or a kill.
+            if ws:
+                ws.close()
+                ws = None
+            time.sleep(2)
+
+
+if __name__ == '__main__':
+    watch(Path.home())

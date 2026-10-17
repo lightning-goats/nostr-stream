@@ -113,6 +113,17 @@ the camera and overlay in that collection. To open a stopped preview during
 repairs, create `~/.config/nostr-stream/hold-stream`; remove it after verifying
 the picture to restore automatic streaming on startup.
 
+Enable `lightning-goats-obs-watch.service` to recover unexpected OBS exits
+during a graphical session (`python3-websockets` version 15 or newer is required).
+The watcher reads OBS's authenticated local websocket and arms recovery only
+after observing an active stream. It relaunches OBS through saved routes if the
+process disappears, bypassing the unclean shutdown prompt. Normal OBS shutdown,
+manual stream stops, and the preview hold disarm recovery. Websocket failures
+alone never restart or kill a running OBS process. Failed recovery launches are
+retried at most once every 30 seconds; startup diagnostics remain private in
+`~/.local/state/obs-recovery/launch.log`. The watcher uses the Snap websocket
+configuration and must be updated alongside the launcher when migrating OBS.
+
 The signer and publisher use `relay.primal.net`, `relay.nostr.net`,
 `nostr.oxtr.dev`, and `nostr.chaima.info`, with `nos.lol` and
 `relay.damus.io` retained as additional fallbacks. Publication signs an event

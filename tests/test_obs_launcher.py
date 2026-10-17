@@ -81,6 +81,21 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(held[held.index("--collection") + 1], "Lightning Goats")
         self.assertIn("--startstreaming", launcher.obs_arguments(False))
 
+    def test_crash_recovery_bypasses_shutdown_prompt_but_keeps_preview_hold(self):
+        launcher = self.module()
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            hold = home / '.config/nostr-stream/hold-stream'
+            hold.parent.mkdir(parents=True)
+            hold.touch()
+            with mock.patch.object(launcher.Path, 'home', return_value=home), \
+                    mock.patch.object(launcher.sys, 'argv', [str(SCRIPT), '--recover']), \
+                    mock.patch.object(launcher.os, 'execve') as execute:
+                launcher.main()
+            arguments = execute.call_args.args[1]
+            self.assertIn('--disable-shutdown-check', arguments)
+            self.assertNotIn('--startstreaming', arguments)
+
     def test_startup_streams_using_saved_routes_without_waiting_for_remote_preparation(self):
         launcher = self.module()
         with tempfile.TemporaryDirectory() as directory:
